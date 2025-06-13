@@ -77,6 +77,13 @@ struct CTXstate {
     /* Channel used to communicate from GPU to CPU receiving thread */
     ChannelDev* channel_dev;
     ChannelHost channel_host;
+
+    enum class RecvThreadState { WORKING, STOP, FINISHED };
+    // After initialization, set it to WORKING to make recv thread get data,
+    // parent thread sets it to STOP to make recv thread stop working.
+    // recv thread sets it to FINISHED when it cleans up.
+    // parent thread should wait until the state becomes FINISHED to clean up.
+    volatile RecvThreadState recv_thread_done = RecvThreadState::STOP;
 };
 
 /* lock */
@@ -517,14 +524,8 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func) {
     }
 }
 
-__global__ void flush_channel(ChannelDev* ch_dev) {
-    /* set a CTA id = -1 to indicate communication thread that this is the
-     * termination flag */
-    mem_access_t ma;
-    ma.cta_id_x = -1;
-    ch_dev->push(&ma, sizeof(mem_access_t));
-    /* flush channel */
-    ch_dev->flush();
+__global__ void flush_channel(ChannelDev* ch_dev) { 
+    ch_dev->flush(); 
 }
 
 void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
@@ -652,8 +653,7 @@ void* recv_thread_fun(void* args) {
     pthread_mutex_unlock(&mutex);
     char* recv_buffer = (char*)malloc(CHANNEL_SIZE);
 
-    bool done = false;
-    while (!done) {
+    while (ctx_state->recv_thread_done == CTXstate::RecvThreadState::WORKING) {
         /* receive buffer from channel */
         uint32_t num_recv_bytes = ch_host->recv(recv_buffer, CHANNEL_SIZE);
         if (num_recv_bytes > 0) {
@@ -667,7 +667,6 @@ void* recv_thread_fun(void* args) {
                  * flush channel kernel that is issues at the end of the
                  * context */
                 if (ma->cta_id_x == -1) {
-                    done = true;
                     break;
                 }
 
@@ -872,6 +871,7 @@ void* recv_thread_fun(void* args) {
     store.create_trace_info();
 
     free(recv_buffer);
+    ctx_state->recv_thread_done = CTXstate::RecvThreadState::FINISHED;
     return NULL;
 }
 
@@ -883,30 +883,40 @@ void nvbit_at_ctx_init(CUcontext ctx) {
     CTXstate* ctx_state = new CTXstate;
     assert(ctx_state_map.find(ctx) == ctx_state_map.end());
     ctx_state_map[ctx] = ctx_state;
+    pthread_mutex_unlock(&mutex);
+}
+
+void init_context_state(CUcontext ctx) {
+    CTXstate* ctx_state = ctx_state_map[ctx];
+    ctx_state->recv_thread_done = CTXstate::RecvThreadState::WORKING;
     cudaMallocManaged(&ctx_state->channel_dev, sizeof(ChannelDev));
     ctx_state->channel_host.init((int)ctx_state_map.size() - 1, CHANNEL_SIZE,
                                  ctx_state->channel_dev, recv_thread_fun, ctx);
     nvbit_set_tool_pthread(ctx_state->channel_host.get_thread());
+}
+
+void nvbit_tool_init(CUcontext ctx) {
+    pthread_mutex_lock(&mutex);
+    assert(ctx_state_map.find(ctx) != ctx_state_map.end());
+    init_context_state(ctx);
     pthread_mutex_unlock(&mutex);
 }
 
 void nvbit_at_ctx_term(CUcontext ctx) {
     pthread_mutex_lock(&mutex);
-
     skip_callback_flag = true;
     if (verbose) {
         printf("MEMTRACE: TERMINATING CONTEXT %p\n", ctx);
     }
-    printf("Success\n");
     /* get context state from map */
     assert(ctx_state_map.find(ctx) != ctx_state_map.end());
     CTXstate* ctx_state = ctx_state_map[ctx];
 
-    /* flush channel */
-    flush_channel<<<1, 1>>>(ctx_state->channel_dev);
-    /* Make sure flush of channel is complete */
-    cudaDeviceSynchronize();
-    assert(cudaGetLastError() == cudaSuccess);
+    /* Notify receiver thread and wait for receiver thread to
+     * notify back */
+    ctx_state->recv_thread_done = CTXstate::RecvThreadState::STOP;
+    while (ctx_state->recv_thread_done != CTXstate::RecvThreadState::FINISHED)
+        ;
 
     ctx_state->channel_host.destroy(false);
     cudaFree(ctx_state->channel_dev);
