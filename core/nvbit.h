@@ -45,7 +45,7 @@
 #include "cuda.h"
 #include "generated_cuda_meta.h"
 
-#define NVBIT_VERSION "1.7.1"
+#define NVBIT_VERSION "1.7.7.1"
 
 /* Instruction class returned by the NVBit inspection API nvbit_get_instrs */
 class Instr {
@@ -113,6 +113,19 @@ typedef struct {
     std::vector<basic_block_t*> bbs;
 } CFG_t;
 
+typedef struct {
+    uint32_t blockDimX;
+    uint32_t blockDimY;
+    uint32_t blockDimZ;
+    uint32_t gridDimX;
+    uint32_t gridDimY;
+    uint32_t gridDimZ;
+
+    uint32_t shmem_static_nbytes;
+    uint32_t shmem_dynamic_nbytes;
+    uint32_t num_registers;
+} func_config_t;
+
 /*
  * callback definitions as enumerated in tools_cuda_api_meta.h
  */
@@ -172,6 +185,33 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
                          const char* event_name, void* params,
                          CUresult* pStatus);
 
+/* This is the function called when a graph node is to be launched. Currently,
+ * it is mainly used with nvbit_set_at_launch() to set tool argument
+ * to each node if each node uses different tool argument. */
+void nvbit_at_graph_node_launch(CUcontext ctx, CUfunction func, CUstream stream,
+                                uint64_t launch_handle);
+
+/*********************************************************************
+ *
+ *          NVBit tool APIs  (provided by NVBit)
+ *
+ **********************************************************************/
+/* Load a tool module into a program context */
+int nvbit_load_tool_module(CUcontext ctx, const void* moduleBinary,
+                            CUmodule* loadedModule);
+
+/* Load a tool kernel from a given tool module (to avoid lazy loading) */
+int nvbit_find_function_by_name(CUcontext ctx, CUmodule mod,
+                                 const char* functionName,
+                                 CUfunction* function);
+
+/* Launch a tool kernel */
+int nvbit_launch_kernel(CUcontext ctx, CUfunction function, uint32_t gridDimX,
+                         uint32_t gridDimY, uint32_t gridDimZ,
+                         uint32_t blockDimX, uint32_t blockDimY,
+                         uint32_t blockDimZ, uint32_t sharedMemBytes,
+                         CUstream stream, void** args, void** extra);
+
 /*********************************************************************
  *
  *          NVBit inspection APIs  (provided by NVBit)
@@ -196,17 +236,20 @@ const char* nvbit_get_func_name(CUcontext ctx, CUfunction f,
 bool nvbit_get_line_info(CUcontext cuctx, CUfunction cufunc, uint32_t offset,
                          char** file_name, char** dir_name, uint32_t* line);
 
+/* Dump the cubin of the given function */
+bool nvbit_dump_cubin(CUcontext cuctx, CUfunction cufunc, const char *filename);
+
 /* Get the SM family */
 uint32_t nvbit_get_sm_family(CUcontext cuctx);
 
 /* Allows to get PC address of the function */
-uint64_t nvbit_get_func_addr(CUfunction func);
+uint64_t nvbit_get_func_addr(CUcontext ctx, CUfunction func);
 
 /* Returns true if function is a kernel (i.e. __global__ ) */
 bool nvbit_is_func_kernel(CUcontext ctx, CUfunction func);
 
 /* Returns a vector with the sizes (in bytes) of each function argument. */
-std::vector<int> nvbit_get_kernel_argument_sizes(CUfunction func);
+std::vector<int> nvbit_get_kernel_argument_sizes(CUcontext ctx, CUfunction func);
 
 /* Allows to get shmem base address from CUcontext
  * shmem range is [shmem_base_addr, shmem_base_addr+16MB) and
@@ -217,6 +260,9 @@ uint64_t nvbit_get_shmem_base_addr(CUcontext cuctx);
  * local mem range is [shmem_base_addr, shmem_base_addr+16MB) and
  * the base address is 16MB aligned.  */
 uint64_t nvbit_get_local_mem_base_addr(CUcontext cuctx);
+
+/* Get function configurations. */
+void nvbit_get_func_config(CUcontext ctx, CUfunction func, func_config_t *config);
 
 /*********************************************************************
  *
@@ -345,9 +391,13 @@ __device__ __noinline__ void nvbit_write_upred_reg(int32_t reg_val);
 void nvbit_enable_instrumented(CUcontext ctx, CUfunction func, bool flag,
                                bool apply_to_related = true);
 
-/* Set a uint64_t argument at launch time, that will be loaded on input
- * argument of the instrumentation function */
-void nvbit_set_at_launch(CUcontext ctx, CUfunction func, uint64_t arg);
+/* Set a uint64_t parameter value at launch time, that will be loaded on input
+ * argument of the instrumentation function. During graph node launch (in
+ * nvbit_at_graph_node_launch()), you need to provide custream and
+ * launch_handle to set tool argument. */
+void nvbit_set_at_launch(CUcontext ctx, CUfunction func, uint64_t param_val,
+                         CUstream custream = nullptr,
+                         uint64_t launch_handle = 0);
 
 /* Notify nvbit of a pthread used by the tool, this pthread will not
  * trigger any call backs even if executing CUDA events of kernel launches.

@@ -25,8 +25,9 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#pragma once
+
 #include <stdint.h>
-#include <string>
 
 #define MAX_GPU_SRC_NUM 4
 #define MAX_GPU_DST_NUM 4

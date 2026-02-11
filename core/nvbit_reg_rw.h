@@ -39,55 +39,58 @@
 
 volatile __device__ int32_t __nvbit_var = 0;
 
+#define FORCE_LINKING(x) { void* volatile dummy = &x; }
+#define TAKE_CODE_SPACE(s) \
+    { _Pragma("unroll") \
+      for (int i = 0; i < s; i++) __nvbit_var += i;\
+    }
+
 /* parameters need to be used in the function to prevent compiler optimizing
  * them away. */
 
 extern "C" __device__ __noinline__ int32_t nvbit_read_reg(uint64_t reg_num) {
-#pragma unroll
-    for (int i = 0; i < 1024; i++) __nvbit_var += i;
-    // assert(__nvbit_var == reg_num);
+    TAKE_CODE_SPACE(1024)
+    FORCE_LINKING(reg_num);
     return __nvbit_var;
 }
 
 extern "C" __device__ __noinline__ void nvbit_write_reg(uint64_t reg_num,
                                                         int32_t reg_val) {
-#pragma unroll
-    for (int i = 0; i < 1024; i++) __nvbit_var += i;
-    // assert(__nvbit_var == reg_num + reg_val);
+    TAKE_CODE_SPACE(1024)
+    FORCE_LINKING(reg_num);
+    FORCE_LINKING(reg_val);
 }
 
 extern "C" __device__ __noinline__ int32_t nvbit_read_ureg(uint64_t reg_num) {
-#pragma unroll
-    for (int i = 0; i < 512; i++) __nvbit_var += i;
-    // assert(__nvbit_var == reg_num);
+    TAKE_CODE_SPACE(512)
+    FORCE_LINKING(reg_num);
     return __nvbit_var;
 }
 
 extern "C" __device__ __noinline__ void nvbit_write_ureg(uint64_t reg_num,
                                                         int32_t reg_val) {
-#pragma unroll
-    for (int i = 0; i < 512; i++) __nvbit_var += i;
+    TAKE_CODE_SPACE(512)
+    FORCE_LINKING(reg_num);
+    FORCE_LINKING(reg_val);
     // assert(__nvbit_var == reg_num + reg_val);
 }
 
 extern "C" __device__ __noinline__ int32_t nvbit_read_pred_reg() {
-#pragma unroll
-    for (int i = 0; i < 32; i++) __nvbit_var += i;
+    TAKE_CODE_SPACE(32)
     return __nvbit_var;
 }
 
 extern "C" __device__ __noinline__ void nvbit_write_pred_reg(int32_t reg_val) {
-#pragma unroll
-    for (int i = 0; i < 32; i++) __nvbit_var += reg_val;
+    TAKE_CODE_SPACE(32)
+    FORCE_LINKING(reg_val);
 }
 
 extern "C" __device__ __noinline__ int32_t nvbit_read_upred_reg() {
-#pragma unroll
-    for (int i = 0; i < 32; i++) __nvbit_var += i;
+    TAKE_CODE_SPACE(32)
     return __nvbit_var;
 }
 
 extern "C" __device__ __noinline__ void nvbit_write_upred_reg(int32_t reg_val) {
-#pragma unroll
-    for (int i = 0; i < 32; i++) __nvbit_var += reg_val;
+    TAKE_CODE_SPACE(32)
+    FORCE_LINKING(reg_val);
 }

@@ -28,7 +28,8 @@ def read_csv(filename):
 def dur_map(column_names, data):
     ret_map = {}
     for kernel_id, row in enumerate(data):
-        key = "x".join(row[-3].split()) + "/" + "x".join(row[-2].split()) + "/" + row[-1].split("<")[0].strip()
+        # key = "x".join(row[-3].split()) + "/" + "x".join(row[-2].split()) + "/" + row[-1].split("<")[0].strip()
+        key = row[-1].split("(")[0].strip()
         if key not in ret_map:
             ret_map[key] = []
         ret_map[key].append((kernel_id, row[column_names.index("Kernel Dur (ns)")]))
@@ -110,10 +111,10 @@ def parse(name, threshold, error, min_n):
     # for key, value in kernel_info.items():
     #     print(f"kernel_ids: {value[1][:math.ceil(value[0])]}")
 
-    duration_sum = 0
-    for row in data_summary:
-        duration_sum += int(row[column_names_summary.index("Total Time (ns)")])
+    duration_sum = sum([int(row[column_names.index("Kernel Dur (ns)")]) for row in data])
     sampled_duration_sum = 0
+
+    sampled_kernels = []
 
     with open(f"{name}_sampled_kernels_info.txt", "w") as file:
         file.write(f"Kernel sampling information from {name}.nsys-rep.\n")
@@ -127,13 +128,17 @@ def parse(name, threshold, error, min_n):
             sample_ids = list(map(int, sample_ids))
             for sample_id in sample_ids:
                 sampled_duration_sum += int(data[sample_id][column_names.index("Kernel Dur (ns)")])
+                sampled_kernels.append(sample_id)
             sample_ids = " ".join(map(str, sample_ids))
             file.write(f"{len(value[1])} {m_min} {sample_ids}\n")
+            
         print(f"Outputs are printed to {name}_sampled_kernels_info.txt") 
 
     print(f"Original number of kernels: {len(data)}")
     print(f"Total number of kernels to run: {tot_kernel}")
     print(f"Speedup: {duration_sum / sampled_duration_sum}") 
+    if args.print_samples:
+        print(f"Sampled kernels: {sampled_kernels}")
 
     return f"{name}_sampled_kernels_info.txt"
 
@@ -161,6 +166,7 @@ if __name__ == "__main__":
     parser.add_argument("--trace_path", default="./", help="Path to store the trace file. Default: ./")
     parser.add_argument("--device_id", required=True, help="CUDA_VISIBLE_DEVICES")
     parser.add_argument("--min_n", type=int, default=30, help="Minimum number of samples.")
+    parser.add_argument("--print_samples", action="store_true", help="Print the kernels to run. Default: False")
     args = parser.parse_args()
 
     device_id = args.device_id

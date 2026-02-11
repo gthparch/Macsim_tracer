@@ -46,8 +46,12 @@ __inline__ __device__ int get_flat_tid() {
 }
 
 __inline__ __device__ uint64_t get_flat_wid() {
-	int bid = blockIdx.x + (gridDim.x * (blockIdx.y + (blockIdx.z * gridDim.y))); // block id 
-	return get_warpid() + (1 << 16) * bid;
+	int bid = blockIdx.x + (gridDim.x * (blockIdx.y + (blockIdx.z * gridDim.y))); // block id
+	// Use logical warp index within block (deterministic, contiguous)
+	// instead of hardware %warpid (non-deterministic SM warp slot)
+	int tid_in_block = threadIdx.x + blockDim.x * (threadIdx.y + blockDim.y * threadIdx.z);
+	int warp_in_block = tid_in_block / 32;
+	return warp_in_block + (1ull << 16) * bid;
 }
 
 extern "C" __device__ __noinline__ void instrument_trace_info(int pred,
@@ -101,9 +105,14 @@ extern "C" __device__ __noinline__ void instrument_trace_info(int pred,
         va_list vl;
         va_start(vl, num_regs);
 
-        for (int i = 0; i < num_regs; i++) {
+        int regs_to_store = (num_regs < 8) ? num_regs : 8;
+        for (int i = 0; i < regs_to_store; i++) {
             int val = va_arg(vl, int);
             ma.reg_id[i] = val;
+        }
+        // Consume remaining args even if we can't store them
+        for (int i = regs_to_store; i < num_regs; i++) {
+            va_arg(vl, int);
         }
         va_end(vl);
     }

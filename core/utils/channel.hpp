@@ -38,9 +38,9 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include "utils.h"
+#include <cuda.h>
 
 #define ULL unsigned long long int
-#define USE_ASYNC_STREAM
 
 class ChannelDev {
   private:
@@ -58,7 +58,9 @@ class ChannelDev {
     ChannelDev() {}
 
     __device__ __forceinline__ void push(void* packet, uint32_t nbytes) {
+#if CUDA_VERSION >= 13010
         // assert(nbytes != 0);
+#endif
 
         uint8_t* curr_ptr = NULL;
 
@@ -103,7 +105,9 @@ class ChannelDev {
         /* make sure everything is visible in memory */
         __threadfence_system();
 
+#if CUDA_VERSION >= 13010
         // assert(*doorbell == 0);
+#endif
         /* notify current buffer has something*/
         *doorbell = nbytes;
 
@@ -129,7 +133,8 @@ class ChannelDev {
 #ifdef USE_ASYNC_STREAM
         CUDA_SAFECALL(cudaMalloc((void**)&buff, buff_size));
 #else
-        CUDA_SAFECALL(cudaMallocManaged((void**)&buff, buff_size));
+        CUDA_SAFECALL(
+            cudaHostAlloc((void**)&buff, buff_size, cudaHostAllocDefault));
 #endif
         buff_write_head_ptr = buff;
         buff_write_tail_ptr = buff;
@@ -213,11 +218,14 @@ class ChannelHost {
             pthread_join(thread, NULL);
         }
         if (dealloc) {
+            CUDA_SAFECALL(cudaFreeHost((int*)doorbell));
 #ifdef USE_ASYNC_STREAM
             CUDA_SAFECALL(cudaStreamDestroy(stream));
-#endif
-            CUDA_SAFECALL(cudaFree((int*)doorbell));
             CUDA_SAFECALL(cudaFree(ch_dev->buff));
+#else
+            CUDA_SAFECALL(cudaFreeHost(ch_dev->buff));
+#endif
+
         }
     }
 

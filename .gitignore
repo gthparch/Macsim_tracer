@@ -20,3 +20,6 @@
 *.so
 macsim.py
 nvbit.py
+
+/temp/
+/tools/main/tool_func/*.fatbin

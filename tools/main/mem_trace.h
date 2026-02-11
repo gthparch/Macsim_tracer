@@ -25,9 +25,15 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#pragma once
+
 #include <stdint.h>
 #include <string>
+#include <unordered_set>
 #include <vector>
+
+/* GPU trace format version */
+static const int GPU_TRACE_VERSION = 14;
 
 enum class MemorySpace {
     NONE,
@@ -40,11 +46,12 @@ enum class MemorySpace {
     SURFACE,   // surface memory operation
     TEXTURE,   // texture memory operation
 };
-constexpr const char* MemorySpaceStr[] = {
+static const char* const MemorySpaceStr[] = {
     "NONE", "LOCAL", "GENERIC", "GLOBAL", "SHARED", "CONSTANT",
     "GLOBAL_TO_SHARED", "SURFACE", "TEXTURE",
 };
-extern const std::string CF_TYPE[] = {
+
+static const std::string CF_TYPE[] = {
     "NOT_CF",
     "CF_BR",
     "CF_CBR",
@@ -55,7 +62,8 @@ extern const std::string CF_TYPE[] = {
     "CF_RET",
     "CF_MITE"
 };
-extern const std::string GPU_NVBIT_OPCODE[] = {
+
+static const std::string GPU_NVBIT_OPCODE[] = {
     "FADD",
     "FADD32I",
     "FCHK",
@@ -181,7 +189,7 @@ extern const std::string GPU_NVBIT_OPCODE[] = {
     "TLD4",
     "TMML",
     "TXD",
-    "TXQ", 
+    "TXQ",
     "SUATOM",
     "SULD",
     "SURED",
@@ -221,214 +229,19 @@ extern const std::string GPU_NVBIT_OPCODE[] = {
     "VOTE"
 };
 
-enum class GPU_NVBIT_OPCODE_ {
-    FADD = 0,
-    FADD32I,
-    FCHK,
-    FFMA32I,
-    FFMA,
-    FMNMX,
-    FMUL,
-    FMUL32I,
-    FSEL,
-    FSET,
-    FSETP,
-    FSWZADD,
-    MUFU,
-    HADD2,
-    HADD2_32I,
-    HFMA2,
-    HFMA2_32I,
-    HMMA,
-    HMUL2,
-    HMUL2_32I,
-    HSET2,
-    HSETP2,
-    DADD,
-    DFMA,
-    DMUL,
-    DSETP,
-    BMMA,
-    BMSK,
-    BREV,
-    FLO,
-    IABS,
-    IADD,
-    IADD3,
-    IADD32I,
-    IDP,
-    IDP4A,
-    IMAD,
-    IMMA,
-    IMNMX,
-    IMUL,
-    IMUL32I,
-    ISCADD,
-    ISCADD32I,
-    ISETP,
-    LEA,
-    LOP,
-    LOP3,
-    LOP32I,
-    POPC,
-    SHF,
-    SHL,
-    SHR,
-    VABSDIFF,
-    VABSDIFF4,
-    F2F,
-    F2I,
-    I2F,
-    I2I,
-    I2IP,
-    FRND,
-    MOV,
-    MOV32I,
-    MOVM,
-    PRMT,
-    SEL,
-    SGXT,
-    SHFL,
-    PLOP3,
-    PSETP,
-    P2R,
-    R2P,
-    LD,
-    LDC,
-    LDG,
-    LDL,
-    LDS,
-    LDSM,
-    ST,
-    STG,
-    STL,
-    STS,
-    MATCH,
-    QSPC,
-    ATOM,
-    ATOMS,
-    ATOMG,
-    RED,
-    CCTL,
-    CCTLL,
-    ERRBAR,
-    MEMBAR,
-    CCTLT,
-    R2UR,
-    S2UR,
-    UBMSK,
-    UBREV,
-    UCLEA,
-    UFLO,
-    UIADD3,
-    UIADD3_64,
-    UIMAD,
-    UISETP,
-    ULDC,
-    ULEA,
-    ULOP,
-    ULOP3,
-    ULOP32I,
-    UMOV,
-    UP2UR,
-    UPLOP3,
-    UPOPC,
-    UPRMT,
-    UPSETP,
-    UR2UP,
-    USEL,
-    USGXT,
-    USHF,
-    USHL,
-    USHR,
-    VOTEU,
-    TEX,
-    TLD,
-    TLD4,
-    TMML,
-    TXD,
-    TXQ,
-    SUATOM,
-    SULD,
-    SURED,
-    SUST,
-    BMOV,
-    BPT,
-    BRA,
-    BREAK,
-    BRX,
-    BRXU,
-    BSSY,
-    BSYNC,
-    CALL,
-    EXIT,
-    JMP,
-    JMX,
-    JMXU,
-    KILL,
-    NANOSLEEP,
-    RET,
-    RPCMOV,
-    RTT,
-    WARPSYNC,
-    YIELD,
-    B2R,
-    BAR,
-    CS2R,
-    DEPBAR,
-    GETLMEMBASE,
-    LEPC,
-    NOP,
-    PMTRIG,
-    R2B,
-    S2R,
-    SETCTAID,
-    SETLMEMBASE,
-    VOTE
+/* OPCODE classification sets — using unordered_set for O(1) lookup */
+static const std::unordered_set<std::string> FP_SET = {
+    "FADD", "FADD32I", "FCHK", "FFMA32I", "FFMA", "FMNMX",
+    "FMUL", "FMUL32I", "FSEL", "FSET", "FSETP", "FSWZADD",
+    "MUFU", "HADD2", "HADD2_32I", "HFMA2", "HFMA2_32I", "HMMA",
+    "HMUL2", "HMUL2_32I", "HSET2", "HSETP2",
+    "DADD", "DFMA", "DMUL", "DSETP"
 };
 
-/* OPCODE list */
-std::vector<std::string> FP_LIST = {
-    "FADD",
-    "FADD32I",
-    "FCHK",
-    "FFMA32I",
-    "FFMA",
-    "FMNMX",
-    "FMUL",
-    "FMUL32I",
-    "FSEL",
-    "FSET",
-    "FSETP",
-    "FSWZADD",
-    "MUFU",
-    "HADD2",
-    "HADD2_32I",
-    "HFMA2",
-    "HFMA2_32I",
-    "HMMA",
-    "HMUL2",
-    "HMUL2_32I",
-    "HSET2",
-    "HSETP2",
-    "DADD",
-    "DFMA",
-    "DMUL",
-    "DSETP"
+static const std::unordered_set<std::string> LD_SET = {
+    "LD", "LDC", "LDG", "LDL", "LDS", "LDSM"
 };
 
-std::vector<std::string> LD_LIST = {
-    "LD",
-    "LDC",
-    "LDG",
-    "LDL",
-    "LDS",
-    "LDSM"
-};
-
-std::vector<std::string> ST_LIST = {
-    "ST",
-    "STG",
-    "STL",
-    "STS"
+static const std::unordered_set<std::string> ST_SET = {
+    "ST", "STG", "STL", "STS"
 };

@@ -79,13 +79,13 @@ enum class OperandType {
     CBANK,
     MREF,
     GENERIC,
-    MEM_DESC
+    MEM_DESC,
 };
 
 constexpr const char* OperandTypeStr[] = {
-    "IMM_UINT64", "IMM_DOUBLE", "REG",  "PRED",   "UREG",
-    "UPRED",      "CBANK",      "MREF", "GENERIC",
-    "MEM_DESC"
+    "IMM_UINT64", "IMM_DOUBLE", "REG",        "PRED",
+    "UREG",       "UPRED",      "CBANK",      "MREF",
+    "GENERIC",    "MEM_DESC",
 };
 
 enum class RegModifierType {

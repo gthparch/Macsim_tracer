@@ -43,7 +43,7 @@ int main() {
     struct dirent *ent;
     std::vector<std::string> dirnames = listDirectories(trace_path);
     std::vector<std::vector<std::string>> filenames;
-    for (int i=0; i<dirnames.size(); i++){
+    for (size_t i=0; i<dirnames.size(); i++){
         std::vector<std::string> filename;
         filenames.push_back(filename);
     }
@@ -82,7 +82,7 @@ int main() {
             while ((bytes_read = input_file.read(reinterpret_cast<char*>(buffer), CHUNK_SIZE).gcount()) > 0) {
                 int bytes_written = gzwrite(output_file, buffer, bytes_read);
                 if (bytes_written == 0) {
-                    std::cerr << "Error writing to output file: " << trace_path + ker + "/" + output_filepath << "\n";
+                    std::cerr << "Error writing to output file: " << output_filepath << "\n";
                     assert(0);
                 }
             }

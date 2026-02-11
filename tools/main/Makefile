@@ -29,6 +29,7 @@
 
 NVCC=nvcc -ccbin=$(CXX) -D_FORCE_INLINES
 PTXAS=ptxas
+BIN2C=bin2c
 
 NVCC_VER_REQ=10.1
 NVCC_VER=$(shell $(NVCC) --version | grep release | cut -f2 -d, | cut -f3 -d' ')
@@ -55,25 +56,38 @@ LIBS=-L$(NVBIT_PATH) -lnvbit
 NVCC_PATH=-L $(subst bin/nvcc,lib64,$(shell which nvcc | tr -s /))
 
 SOURCES=$(wildcard *.cu)
+TOOL_FUNC_SOURCES=$(wildcard tool_func/*.cu)
 
 OBJECTS=$(SOURCES:.cu=.o)
+TOOL_FUNC_FATBINS=$(TOOL_FUNC_SOURCES:.cu=.fatbin)
+TOOL_FUNC_BIN2CS=$(TOOL_FUNC_FATBINS:.fatbin=.c)
 ARCH?=all
+COMPRESS_TOOL=compress
 
 mkfile_path := $(abspath $(lastword $(MAKEFILE_LIST)))
 current_dir := $(notdir $(patsubst %/,%,$(dir $(mkfile_path))))
 
 NVBIT_TOOL=$(current_dir).so
 
-all: $(NVBIT_TOOL)
+all: $(NVBIT_TOOL) $(COMPRESS_TOOL)
 
 $(NVBIT_TOOL): $(OBJECTS) $(NVBIT_PATH)/libnvbit.a
 	$(NVCC) -arch=$(ARCH) -O3 $(OBJECTS) $(LIBS) $(NVCC_PATH) -lcuda -lcudart_static -shared -o $@
 
-%.o: %.cu
+tool_func/%.fatbin: tool_func/%.cu
+	$(NVCC) -arch=$(ARCH) $(INCLUDES) -O3 -fatbin $< -o $@
+
+tool_func/%.c: tool_func/%.fatbin
+	$(BIN2C) -c --name $(basename $(notdir $<))_bin $< > $@
+
+%.o: %.cu $(TOOL_FUNC_BIN2CS)
 	$(NVCC) -dc -c -std=c++11 $(INCLUDES) -Xptxas -cloning=no -Xcompiler -Wall -arch=$(ARCH) -O3 -Xcompiler -fPIC $< -o $@
 
 inject_funcs.o: inject_funcs.cu
 	$(NVCC) $(INCLUDES) $(MAXRREGCOUNT_FLAG) -Xptxas -astoolspatch --keep-device-functions -arch=$(ARCH) -Xcompiler -Wall -Xcompiler -fPIC -c $< -o $@
+
+$(COMPRESS_TOOL): compress.cc
+	g++ -o compress compress.cc -lz
 
 clean:
 	rm -f *.so *.o

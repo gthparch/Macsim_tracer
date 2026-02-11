@@ -39,17 +39,11 @@
 #include <iostream>
 #include <fstream>
 #include <vector>
-#include <thread>
-#include <mutex>
-#include <queue>
-#include <set>
-#include <condition_variable>
-#include <functional>
 #include <algorithm>
+#include <set>
 #include <cuda_runtime.h>
 #include <cstdlib>
 #include <sys/stat.h>
-#include <fstream>
 
 /* every tool needs to include this once */
 #include "nvbit_tool.h"
@@ -63,6 +57,8 @@
 /* contains definition of the mem_access_t structure */
 #include "common.h"
 #include "mem_trace.h"
+
+#include "tool_func/flush_channel.c"
 
 #define HEX(x)                                                            \
     "0x" << std::setfill('0') << std::setw(16) << std::hex << (uint64_t)x \
@@ -78,12 +74,21 @@ struct CTXstate {
     ChannelDev* channel_dev;
     ChannelHost channel_host;
 
+    /* tool module */
+    CUmodule tool_module;
+
+    /* flush channel function */
+    CUfunction flush_channel_func;
+
     enum class RecvThreadState { WORKING, STOP, FINISHED };
     // After initialization, set it to WORKING to make recv thread get data,
     // parent thread sets it to STOP to make recv thread stop working.
     // recv thread sets it to FINISHED when it cleans up.
     // parent thread should wait until the state becomes FINISHED to clean up.
     volatile RecvThreadState recv_thread_done = RecvThreadState::STOP;
+
+    // whether the context and the channel need a synchronization.
+    bool need_sync = false;
 };
 
 /* lock */
@@ -116,7 +121,7 @@ uint64_t grid_launch_id = 0;
 /* Trace file path */
 std::string trace_path = "./default/";
 std::string sampled_kernel_path = "";
-std::string compress_path = "/fast_data/echung67/nvbit_release/tools/main/compress";
+std::string compress_path = "./compress";
 std::vector<int> sampled_kernel_ids;
 
 bool file_exists(const std::string& file_path) {
@@ -130,118 +135,83 @@ public:
     int add(const std::string& str) {
         int new_id = kernels.size();
         kernels.push_back(str);
-
-        std::priority_queue<uint64_t, std::vector<uint64_t>, std::greater<uint64_t>> warp_id;
-        std::set<uint64_t> warp_id_s;
-        std::unordered_map<uint64_t, uint64_t> instr_count;
-        warp_ids.push_back(warp_id);
-        warp_ids_s.push_back(warp_id_s);
-        instr_counts.push_back(instr_count);
+        instr_counts.emplace_back();
         return new_id;
     }
+
     const std::string& get_string(int id) const {
         return kernels[id];
     }
-    void create_trace_info() {
-        for (int i = 0; i < static_cast<int>(kernels.size()); i++){
-            // Print the elements in the heap in order
-            // std::string str = get_string(i);
 
-            if (file_exists(trace_path + "Kernel" + std::to_string(i))) {
-                std::ofstream file_trace(trace_path + "Kernel" + std::to_string(i) + "/" + "trace.txt", std::ios_base::app);
-                std::ofstream file_info_trace(trace_path + "Kernel" + std::to_string(i) + "/" + "trace_info.txt", std::ios_base::app);
-                file_trace << warp_ids[i].size() << std::endl; // Total number of warps
+    /* Write trace.txt and trace_info.txt for each kernel directory.
+     * With logical warp IDs, no renaming is needed — IDs are already
+     * contiguous within each block. */
+    void write_trace_files() {
+        for (int i = 0; i < static_cast<int>(kernels.size()); i++) {
+            std::string kernel_dir = trace_path + "Kernel" + std::to_string(i);
+            if (!file_exists(kernel_dir)) continue;
 
-                uint64_t rank = 0;
-                std::vector<uint64_t> sorted_warp_ids;
+            std::ofstream file_trace(kernel_dir + "/trace.txt", std::ios_base::app);
+            std::ofstream file_info_trace(kernel_dir + "/trace_info.txt", std::ios_base::app);
 
-                while (!warp_ids[i].empty()) {
-                    uint64_t element = warp_ids[i].top();
-                    warp_ids[i].pop();
-                    uint64_t new_element = (element >= (1ull << 16)) ? element : rank++;
-
-                    // std::cout << "Kernel: " << i << ", " << element << "->" << new_element << std::endl;
-
-                    file_trace << new_element << " " << "0" << std::endl;
-                    auto it = instr_counts[i].find(element);
-                    if (it == instr_counts[i].end()) {
-                        std::cout << "Element with key=" << it->first << " not found." << std::endl;
-                    }
-                    file_info_trace << new_element << " " << it->second << std::endl; // number of instructions in one trace*.raw file
-
-                    if (element != new_element) {
-                        std::string old_file_name = trace_path + "Kernel" + std::to_string(i) + "/bin_trace_" + std::to_string(element) + ".raw";
-                        std::string new_file_name = trace_path + "Kernel" + std::to_string(i) + "/bin_trace_" + std::to_string(new_element) + ".raw";
-                        
-                        int rename = std::rename(old_file_name.c_str(), new_file_name.c_str());
-                        if (rename != 0) {
-                            std::cout << old_file_name << " -> " << new_file_name << std::endl;
-                            std::cout << "Error: " << strerror(errno) << std::endl;
-                            // assert(0);
-                        }
-                    }
-                }
-                file_trace.close();
-                file_info_trace.close();
+            /* Collect and sort warp IDs for deterministic output */
+            std::vector<uint64_t> sorted_warp_ids;
+            sorted_warp_ids.reserve(instr_counts[i].size());
+            for (const auto& kv : instr_counts[i]) {
+                sorted_warp_ids.push_back(kv.first);
             }
+            std::sort(sorted_warp_ids.begin(), sorted_warp_ids.end());
+
+            file_trace << sorted_warp_ids.size() << std::endl;
+            for (uint64_t warp_id : sorted_warp_ids) {
+                file_trace << warp_id << " " << "0" << std::endl;
+                file_info_trace << warp_id << " " << instr_counts[i][warp_id] << std::endl;
+            }
+
+            file_trace.close();
+            file_info_trace.close();
         }
     }
-
-    /* Warp ids */
-    std::vector<std::priority_queue<uint64_t, std::vector<uint64_t>, std::greater<uint64_t>>> warp_ids;
-    std::vector<std::set<uint64_t>> warp_ids_s;
 
     /* counting the number of instructions per one trace*.raw */
     std::vector<std::unordered_map<uint64_t, uint64_t>> instr_counts;
     std::vector<std::string> kernels;
 };
 
-bool is_fp(std::string opcode){
+/* Opcode classification helpers — extract short opcode once */
+static std::string get_opcode_short(const std::string& opcode) {
     std::size_t dot_pos = opcode.find('.');
-    std::string opcode_short = opcode.substr(0, dot_pos);
-
-    auto it = std::find(FP_LIST.begin(), FP_LIST.end(), opcode_short);
-    return (it != FP_LIST.end())? true : false;
+    return opcode.substr(0, dot_pos);
 }
 
-bool is_ld(std::string opcode){
-    std::size_t dot_pos = opcode.find('.');
-    std::string opcode_short = opcode.substr(0, dot_pos);
-
-    auto it = std::find(LD_LIST.begin(), LD_LIST.end(), opcode_short);
-    return (it != LD_LIST.end()) ? true : false;
+bool is_fp(const std::string& opcode_short) {
+    return FP_SET.count(opcode_short) > 0;
 }
 
-bool is_st(std::string opcode){
-    std::size_t dot_pos = opcode.find('.');
-    std::string opcode_short = opcode.substr(0, dot_pos);
+bool is_ld(const std::string& opcode_short) {
+    return LD_SET.count(opcode_short) > 0;
+}
 
-    auto it = std::find(ST_LIST.begin(), ST_LIST.end(), opcode_short);
-    return (it != ST_LIST.end()) ? true : false;
+bool is_st(const std::string& opcode_short) {
+    return ST_SET.count(opcode_short) > 0;
 }
 
 // Check if the directory exists. If there isn't, make one. 
-bool create_a_directory(std::string dir_path, bool print) {
-    const char* c_dir_path = dir_path.c_str();
+bool create_a_directory(const std::string& dir_path, bool print) {
     struct stat info;
-    if (stat(c_dir_path, &info) != 0) {
-        // Directory doesn't exist, create it
-        int result = mkdir(c_dir_path, 0777);
-        if (result != 0) {
-            std::cerr << "Error: Failed to create directory." << std::endl;
-            return 1;
+    if (stat(dir_path.c_str(), &info) != 0) {
+        if (mkdir(dir_path.c_str(), 0777) != 0) {
+            std::cerr << "Error: Failed to create directory: " << dir_path << std::endl;
+            return false;
         }
-        if (print) std::cout << "Directory " << c_dir_path << " created." << std::endl;
+        if (print) std::cout << "Directory " << dir_path << " created." << std::endl;
+    } else if (!(info.st_mode & S_IFDIR)) {
+        std::cerr << "Error: Path is not a directory: " << dir_path << std::endl;
+        return false;
+    } else {
+        if (print) std::cout << "Directory " << dir_path << " already exists." << std::endl;
     }
-    else if (info.st_mode & S_IFDIR) {
-        // Directory exists
-        if (print) std::cout << "Directory " << c_dir_path << " already exists." << std::endl;
-    }
-    else {
-        std::cerr << "Error: Path is not a directory." << std::endl;
-        return 1;
-    }
-    return 0;
+    return true;
 }
 
 // Remove bracket in kernel name 
@@ -251,21 +221,7 @@ std::string rm_bracket (std::string kernel_name){
     return kernel_name.substr(0, pos_bracket);
 }
 
-// not sure..
-std::string cf_type(std::string opcode){ 
-    // NOT_CF,  //!< not a control flow instruction
-    // CF_BR,  //!< an unconditional branch
-    // CF_CBR,  //!< a conditional branch
-    // CF_CALL,  //!< a call
-    // // below this point are indirect cfs
-    // CF_IBR,  //!< an indirect branch // non conditional
-    // CF_ICALL,  //!< an indirect call
-    // CF_ICO,  //!< an indirect jump to co-routine
-    // CF_RET,  //!< a return
-    // CF_MITE,  //!< alpha PAL, micro-instruction assited instructions
-
-    std::size_t dot_pos = opcode.find('.');
-    std::string opcode_short = opcode.substr(0, dot_pos);
+std::string cf_type(const std::string& opcode_short){ 
     if (opcode_short == "JMP")
         return "CF_BR";
     else if (opcode_short == "BRA")
@@ -276,47 +232,38 @@ std::string cf_type(std::string opcode){
         return "NOT_CF";
 }
 
-uint8_t num_dst_reg(mem_access_t* ma){
-    std::string opcode = id_to_opcode_map[ma->opcode_id];
-    std::size_t dot_pos = opcode.find('.');
-    std::string opcode_short = opcode.substr(0, dot_pos);
-    if (is_st(opcode) || opcode_short == "BRA" || opcode_short == "EXIT" || opcode_short == "BAR"
-                      || opcode_short == "BSSY" || opcode_short == "BSYNC" || opcode_short == "CALL"
-                      || opcode_short == "BREAK")
+uint8_t num_dst_reg(const std::string& opcode_short){
+    if (is_st(opcode_short) || opcode_short == "BRA" || opcode_short == "EXIT" || opcode_short == "BAR"
+                            || opcode_short == "BSSY" || opcode_short == "BSYNC" || opcode_short == "CALL"
+                            || opcode_short == "BREAK")
         return 0;
     else 
         return 1;
 }
 
-void src_reg(mem_access_t* ma, uint16_t* src_reg_){
-    for(int i=num_dst_reg(ma), j=0; i<ma->num_regs; i++, j++){
+void src_reg(mem_access_t* ma, uint8_t n_dst, uint16_t* src_reg_){
+    for(int i=n_dst, j=0; i<ma->num_regs; i++, j++){
         src_reg_[j] = ma->reg_id[i];
     }
-    return;
 }
 
-void dst_reg(mem_access_t* ma, uint16_t* dst_reg_){
-    for(int i=0; i<num_dst_reg(ma); i++){
+void dst_reg(mem_access_t* ma, uint8_t n_dst, uint16_t* dst_reg_){
+    for(int i=0; i<n_dst; i++){
         dst_reg_[i] = ma->reg_id[i];
     }
-    return;
 }
 
-int num_child_trace(uint64_t* mem_addrs, size_t size, uint32_t active_mask, int* min_nonzero_idx){
-    uint64_t min_nonzero = (uint64_t)-1;
-    uint64_t max = 0;
-    for (int i = 0; i < (int)size; i++) {
-        if (mem_addrs[i] != 0 && (active_mask & ( 1 << i )) >> i && mem_addrs[i] < min_nonzero) {
-            min_nonzero = mem_addrs[i];
-            *min_nonzero_idx = i;
-        }
-        if ((active_mask & ( 1 << i )) >> i && mem_addrs[i] > max) {
-            max = mem_addrs[i];
+/* Compute distinct 128B-aligned sector addresses touched by active threads.
+ * Returns a sorted vector of sector start addresses. */
+std::vector<uint64_t> compute_coalesced_sectors(
+    uint64_t* mem_addrs, uint32_t active_mask) {
+    std::set<uint64_t> sectors;
+    for (int i = 0; i < 32; i++) {
+        if ((active_mask & (1u << i)) && mem_addrs[i] != 0) {
+            sectors.insert(mem_addrs[i] & ~(uint64_t)127);  // align down to 128B
         }
     }
-    // fix me!!
-    int num_child = (min_nonzero == (uint64_t)-1) ? 0 : (int)(max - min_nonzero) / 128;
-    return (num_child > 32) ? 32 : num_child;
+    return std::vector<uint64_t>(sectors.begin(), sectors.end());
 }
 
 void nvbit_at_init() {
@@ -335,7 +282,7 @@ void nvbit_at_init() {
         "End of the kernel interval where to generate traces");
     GET_VAR_INT(verbose, "TOOL_VERBOSE", 0, "Enable verbosity inside the tool");
     GET_VAR_STR(trace_path, "TRACE_PATH", "Path to trace file. Default: './default/'");
-    GET_VAR_STR(compress_path, "COMPRESSOR_PATH", "Path to the compressor binary file. Default: '/fast_data/echung67/nvbit_release/tools/main/compress'");
+    GET_VAR_STR(compress_path, "COMPRESSOR_PATH", "Path to the compressor binary file. Default: './compress'");
     GET_VAR_INT(trace_debug, "DEBUG_TRACE", 0, "Generate human-readable debug traces together");
     GET_VAR_INT(overwrite, "OVERWRITE", 0, "Overwrite the previously generated traces in TRACE_PATH directory");
     GET_VAR_STR(sampled_kernel_path, "SAMPLED_KERNEL_INFO", "Path to the file that contains the list of kernels to be sampled. Default: ''");
@@ -358,15 +305,15 @@ void nvbit_at_init() {
             std::cerr << "Error: Failed to rm -rf " + trace_path + "Kernel*" << std::endl;
             assert(0);
         }
-        if (system(("rm -f " + trace_path + "kernel_config.txt " + trace_path + "kernel_names.txt " + trace_path + "compress" + trace_path + "sampled*").c_str()) != 0){
-            std::cerr << "Error: Failed to rm -f " + trace_path + "kernel_config.txt kernel_names.txt compress" << std::endl;
+        if (system(("rm -f '" + trace_path + "kernel_config.txt' '" + trace_path + "kernel_names.txt' '" + trace_path + "compress' '" + trace_path + "'sampled*").c_str()) != 0){
+            std::cerr << "Error: Failed to rm -f config/names/compress files" << std::endl;
             assert(0);
         }
     }
 
     std::ofstream file_kernel_config(trace_path + "kernel_config.txt", std::ios_base::app);
     file_kernel_config << "nvbit" << std::endl;
-    file_kernel_config << "14" << std::endl; // GPU Trace version
+    file_kernel_config << GPU_TRACE_VERSION << std::endl;
     file_kernel_config << "-1" << std::endl;
     file_kernel_config.close();
 
@@ -444,7 +391,7 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func) {
             printf(
                 "MEMTRACE: CTX %p, Inspecting CUfunction %p name %s at address "
                 "0x%lx\n",
-                ctx, f, nvbit_get_func_name(ctx, f), nvbit_get_func_addr(f));
+                ctx, f, nvbit_get_func_name(ctx, f), nvbit_get_func_addr(ctx, f));
         }
 
         uint32_t cnt = 0;
@@ -498,11 +445,11 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func) {
             /* instruction size */
             nvbit_add_call_arg_const_val32(instr, 16); // 128bit instructions
             /* PC address */
-            nvbit_add_call_arg_const_val64(instr, nvbit_get_func_addr(func) + instr->getOffset());
+            nvbit_add_call_arg_const_val64(instr, nvbit_get_func_addr(ctx, func) + instr->getOffset());
             /* Branch target address (care about predicates?) */
             uint64_t branchAddrOffset = (std::string(instr->getOpcodeShort()) == "BRA") ? 
-                instr->getOperand(instr->getNumOperands()-1)->u.imm_uint64.value + nvbit_get_func_addr(func) :
-                nvbit_get_func_addr(func) + instr->getOffset() + 0x10;
+                instr->getOperand(instr->getNumOperands()-1)->u.imm_uint64.value + nvbit_get_func_addr(ctx, func) :
+                nvbit_get_func_addr(ctx, func) + instr->getOffset() + 0x10;
             nvbit_add_call_arg_const_val64(instr, branchAddrOffset);
             /* MEM access address / reconv(??) address */
             nvbit_add_call_arg_mref_addr64(instr);
@@ -522,10 +469,6 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func) {
             cnt++;
         }
     }
-}
-
-__global__ void flush_channel(ChannelDev* ch_dev) { 
-    ch_dev->flush(); 
 }
 
 void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
@@ -557,6 +500,8 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
         }
 
         if (!is_exit) {
+            ctx_state->need_sync = true;
+
             /* instrument */
             instrument_function_if_needed(ctx, p->f);
 
@@ -570,10 +515,10 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
                                    CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, p->f));
 
             /* get function name and pc */
-            uint64_t pc = nvbit_get_func_addr(p->f);
+            uint64_t pc = nvbit_get_func_addr(ctx, p->f);
 
             /* set grid launch id at launch time */
-            nvbit_set_at_launch(ctx, p->f, (uint64_t)&grid_launch_id);
+            nvbit_set_at_launch(ctx, p->f, (uint64_t)grid_launch_id);
 
             /* enable instrumented code to run */
             nvbit_enable_instrumented(ctx, p->f, false);
@@ -590,7 +535,7 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
                 cuGetErrorString(result, &pStr);
                 printf("[Error] cuOccupancyMaxActiveBlocksPerMultiprocessor() = %s\n", pStr);
                 fflush(stdout);
-                assert(err == CUDA_SUCCESS);
+                assert(result == CUDA_SUCCESS);
             }
 
             // If the sampled_kernel_info file exists, check if the kernel is in the list.
@@ -608,7 +553,7 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
 
                 std::ofstream file_trace(kernel_dir + "/" + "trace.txt");
                 file_trace << "nvbit" << std::endl;
-                file_trace << "14" << std::endl; // GPU Trace version
+                file_trace << GPU_TRACE_VERSION << std::endl;
                 file_trace << numBlocks << std::endl;
                 file_trace.close();
 
@@ -624,14 +569,6 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
             "Block size: (" << p->blockDimX << ", " << p->blockDimY << ", " << p->blockDimZ << "), " <<
             "maxBlockPerCore: " << numBlocks <<
             ", # of regs: " << nregs << ", static shared mem: " << shmem_static_nbytes << ", dynamic shared mem: " << p->sharedMemBytes << std::endl;
-            // printf(
-            //     "MEMTRACE: CTX 0x%016lx - LAUNCH - Kernel pc 0x%016lx - Kernel "
-            //     "name %s - grid launch id %ld - grid size %d,%d,%d - block "
-            //     "size %d,%d,%d - nregs %d - shmem %d - cuda stream id %ld\n",
-            //     (uint64_t)ctx, pc, func_name.c_str(), grid_launch_id, p->gridDimX,
-            //     p->gridDimY, p->gridDimZ, p->blockDimX, p->blockDimY,
-            //     p->blockDimZ, nregs, shmem_static_nbytes + p->sharedMemBytes,
-            //     (uint64_t)p->hStream);
 
             /* increment grid launch id for next launch */
             grid_launch_id++;
@@ -673,65 +610,56 @@ void* recv_thread_fun(void* args) {
                 std::stringstream ss;
 
                 int kernel_id = static_cast<int>(ma->grid_launch_id);
-                // std::string kernel_name = store.get_string(kernel_id) + "_" + std::to_string(kernel_id);
                 std::string kernel_name = "Kernel" + std::to_string(kernel_id);
                 std::string filename = "bin_trace_" + std::to_string(ma->warp_id) + ".txt";
-                std::string filename_raw ="bin_trace_" + std::to_string(ma->warp_id) + ".raw";
-                // const char * filename_gz = (trace_path +"trace_" + std::to_string(ma->warp_id) + ".gz").c_str();
+                std::string filename_raw = "bin_trace_" + std::to_string(ma->warp_id) + ".raw";
                 std::string opcode = id_to_opcode_map[ma->opcode_id];
+                std::string opcode_short = get_opcode_short(opcode);
 
-                // find element with ma->warp_id in the map. 
-                auto itt = store.instr_counts[kernel_id].find(ma->warp_id);
-                if (itt != store.instr_counts[kernel_id].end()) {
-                    itt->second++;
-                } else {
-                    store.instr_counts[kernel_id].insert({ma->warp_id, 1});
-                }
+                /* Increment instruction count for this warp */
+                store.instr_counts[kernel_id][ma->warp_id]++;
 
-                std::size_t dot_pos = opcode.find('.');
-                std::string opcode_short = opcode.substr(0, dot_pos);
                 uint8_t opcode_int = 255;
                 auto it = std::find(std::begin(GPU_NVBIT_OPCODE), std::end(GPU_NVBIT_OPCODE), opcode_short);
                 if (it != std::end(GPU_NVBIT_OPCODE)) {
                     opcode_int = (uint8_t)std::distance(std::begin(GPU_NVBIT_OPCODE), it);
                 }
                 uint8_t cf_type_int = 255;
-                it = std::find(std::begin(CF_TYPE), std::end(CF_TYPE), cf_type(opcode));
-                if (it != std::end(CF_TYPE)) {
-                    cf_type_int = (uint8_t)std::distance(std::begin(CF_TYPE), it);
+                std::string cf_type_str = cf_type(opcode_short);
+                auto it2 = std::find(std::begin(CF_TYPE), std::end(CF_TYPE), cf_type_str);
+                if (it2 != std::end(CF_TYPE)) {
+                    cf_type_int = (uint8_t)std::distance(std::begin(CF_TYPE), it2);
                 }
-                uint8_t num_dst_reg_ = num_dst_reg(ma);
+                uint8_t num_dst_reg_ = num_dst_reg(opcode_short);
                 uint8_t num_src_reg_ = ma->num_regs - num_dst_reg_;
                 if (ma->num_regs <= num_dst_reg_) num_src_reg_ = 0;
                 uint16_t src_reg_[MAX_GPU_SRC_NUM];
                 uint16_t dst_reg_[MAX_GPU_DST_NUM];
                 memset(src_reg_, 0, sizeof(src_reg_));
                 memset(dst_reg_, 0, sizeof(dst_reg_));
-                src_reg(ma, src_reg_);
-                dst_reg(ma, dst_reg_);
+                src_reg(ma, num_dst_reg_, src_reg_);
+                dst_reg(ma, num_dst_reg_, dst_reg_);
                 uint8_t inst_size = ma->size; // always 4? 8?
                 uint32_t active_mask = ma->active_mask;
                 uint32_t br_taken_mask = 0; // should be added soon
                 uint64_t func_addr = ma->func_addr;
                 uint64_t br_target_addr = ma->branch_target_addr;
-                uint64_t mem_addr = (is_ld(opcode) || is_st(opcode)) ? ma->mem_addr : 0; // or m_reconv_inst_addr
-                uint8_t mem_access_size = ma->mem_access_size; // or m_barrier_id
-                uint16_t m_num_barrier_threads = 0; // should be added soon
-                uint8_t m_addr_space = ma->m_addr_space; // or m_level (memory barrier level)
+                uint64_t mem_addr = (is_ld(opcode_short) || is_st(opcode_short)) ? ma->mem_addr : 0;
+                uint8_t mem_access_size = ma->mem_access_size;
+                uint16_t m_num_barrier_threads = 0;
+                uint8_t m_addr_space = ma->m_addr_space;
                 std::string m_addr_space_str = MemorySpaceStr[m_addr_space];
-                uint8_t m_cache_level = 0; // should be added soon
-                uint8_t m_cache_operator = 0; // should be added soon
+                uint8_t m_cache_level = 0;
+                uint8_t m_cache_operator = 0;
                 uint64_t mem_addrs[32];
                 for (int i = 0; i < 32; i++) mem_addrs[i] = ma->addrs[i];
-                // count 1s in active_mask
                 uint8_t active_threads = __builtin_popcount(active_mask);
-                // children thread number for memory operations
-                // if(is_ld(opcode) || is_st(opcode)) br_target_addr = active_threads; 
+
                 
                 trace_info_nvbit_small_s cur_trace;
                 cur_trace.m_opcode = opcode_int;
-                cur_trace.m_is_fp = is_fp(opcode);
-                cur_trace.m_is_load = is_ld(opcode);
+                cur_trace.m_is_fp = is_fp(opcode_short);
+                cur_trace.m_is_load = is_ld(opcode_short);
                 cur_trace.m_cf_type = cf_type_int;
                 cur_trace.m_num_read_regs = num_src_reg_;
                 cur_trace.m_num_dest_regs = num_dst_reg_;
@@ -748,32 +676,31 @@ void* recv_thread_fun(void* args) {
                 cur_trace.m_addr_space = m_addr_space;
                 cur_trace.m_cache_level = m_cache_level;
                 cur_trace.m_cache_operator = m_cache_operator;
-                if(store.warp_ids_s[kernel_id].find(ma->warp_id) == store.warp_ids_s[kernel_id].end()) {
-                    store.warp_ids[kernel_id].push(ma->warp_id);
-                    store.warp_ids_s[kernel_id].insert(ma->warp_id);
-                }
 
-                // size = 32 
-                size_t size = sizeof(mem_addrs) / sizeof(mem_addrs[0]);
-                int min_nonzero_idx;
-                int num_child_trace_ = num_child_trace(mem_addrs, size, active_mask, &min_nonzero_idx);
-                assert(num_child_trace_ <= 32);
+                /* Compute 128B-aligned sectors touched by this warp instruction */
                 std::vector<trace_info_nvbit_small_s> children_trace;
-                for (int i = 1; i < num_child_trace_; i++){
-                    trace_info_nvbit_small_s child_trace;
-                    memcpy(&child_trace, &cur_trace, sizeof(child_trace));
-                    if (num_child_trace_ == 32){
-                        child_trace.m_mem_addr = mem_addrs[i];
-                    } else {
-                        child_trace.m_mem_addr = mem_addrs[min_nonzero_idx] + i * 128;
+                if (is_ld(opcode_short) || is_st(opcode_short)) {
+                    std::vector<uint64_t> sectors = compute_coalesced_sectors(mem_addrs, active_mask);
+                    int num_sectors = (int)sectors.size();
+
+                    /* Parent trace gets the first sector address */
+                    if (num_sectors > 0) {
+                        cur_trace.m_mem_addr = sectors[0];
                     }
-                    if (i != min_nonzero_idx && child_trace.m_mem_addr != 0) 
+
+                    /* Children get remaining sectors */
+                    for (int i = 1; i < num_sectors; i++) {
+                        trace_info_nvbit_small_s child_trace;
+                        memcpy(&child_trace, &cur_trace, sizeof(child_trace));
+                        child_trace.m_mem_addr = sectors[i];
                         children_trace.push_back(child_trace);
-                }
-                if (num_child_trace_ && (is_ld(opcode) || is_st(opcode))){
-                    // std::cout << "num_child_trace: " << num_child_trace_ << std::endl;
-                    cur_trace.m_mem_access_size *= num_child_trace_;
-                    mem_access_size *= num_child_trace_;
+                    }
+
+                    /* Scale parent access size by total number of sectors */
+                    if (num_sectors > 1) {
+                        cur_trace.m_mem_access_size *= num_sectors;
+                        mem_access_size *= num_sectors;
+                    }
                 }
 
                 pthread_mutex_lock(&file_mutex);
@@ -785,9 +712,9 @@ void* recv_thread_fun(void* args) {
                         assert(0);
                     }
                     file << opcode << std::endl;
-                    file << std::dec << is_fp(opcode) << std::endl;
-                    file << is_ld(opcode) << std::endl;
-                    file << cf_type(opcode) << std::endl;
+                    file << std::dec << is_fp(opcode_short) << std::endl;
+                    file << is_ld(opcode_short) << std::endl;
+                    file << cf_type_str << std::endl;
                     file << (int)num_src_reg_ << std::endl;
                     file << (int)num_dst_reg_ << std::endl;
                     file << src_reg_[0] << std::endl;
@@ -810,12 +737,12 @@ void* recv_thread_fun(void* args) {
                     file << (int)m_cache_level << std::endl;
                     file << (int)m_cache_operator << std::endl;
                     file << std::endl;
-                    if(is_ld(opcode) || is_st(opcode)) { //children threads for ld/store
+                    if(is_ld(opcode_short) || is_st(opcode_short)) {
                         for (int i = 0; i < (int)children_trace.size(); i++){
                             file << opcode << " (child)" << std::endl;
-                            file << std::dec << is_fp(opcode) << std::endl;
-                            file << is_ld(opcode) << std::endl;
-                            file << cf_type(opcode) << std::endl;
+                            file << std::dec << is_fp(opcode_short) << std::endl;
+                            file << is_ld(opcode_short) << std::endl;
+                            file << cf_type_str << std::endl;
                             file << (int)num_src_reg_ << std::endl;
                             file << (int)num_dst_reg_ << std::endl;
                             file << src_reg_[0] << std::endl;
@@ -850,7 +777,7 @@ void* recv_thread_fun(void* args) {
                 }
                 file_raw.write(reinterpret_cast<const char*>(&cur_trace), sizeof(cur_trace));
                 
-                if(is_ld(opcode) || is_st(opcode)) { //children threads for ld/store
+                if(is_ld(opcode_short) || is_st(opcode_short)) {
                     for (int i = 0; i < (int)children_trace.size(); i++){
                         file_raw.write(reinterpret_cast<const char*>(&children_trace[i]), sizeof(children_trace[i]));
                         auto itt = store.instr_counts[kernel_id].find(ma->warp_id);
@@ -867,8 +794,7 @@ void* recv_thread_fun(void* args) {
         }
     }
 
-    // Print the elements in the heap in order
-    store.create_trace_info();
+    store.write_trace_files();
 
     free(recv_buffer);
     ctx_state->recv_thread_done = CTXstate::RecvThreadState::FINISHED;
@@ -888,6 +814,13 @@ void nvbit_at_ctx_init(CUcontext ctx) {
 
 void init_context_state(CUcontext ctx) {
     CTXstate* ctx_state = ctx_state_map[ctx];
+
+    /* Load tool module and find flush_channel function */
+    nvbit_load_tool_module(ctx, (const void*)flush_channel_bin,
+                           &ctx_state->tool_module);
+    nvbit_find_function_by_name(ctx, ctx_state->tool_module, "flush_channel",
+                                &ctx_state->flush_channel_func);
+
     ctx_state->recv_thread_done = CTXstate::RecvThreadState::WORKING;
     cudaMallocManaged(&ctx_state->channel_dev, sizeof(ChannelDev));
     ctx_state->channel_host.init((int)ctx_state_map.size() - 1, CHANNEL_SIZE,
@@ -911,6 +844,18 @@ void nvbit_at_ctx_term(CUcontext ctx) {
     /* get context state from map */
     assert(ctx_state_map.find(ctx) != ctx_state_map.end());
     CTXstate* ctx_state = ctx_state_map[ctx];
+
+    /* Flush channel if there was a kernel launch before context termination
+     * so that any remaining data in the GPU-side buffer is sent to the host
+     * recv thread before we shut it down. */
+    if (ctx_state->need_sync) {
+        void* args[] = {&ctx_state->channel_dev};
+        nvbit_launch_kernel(ctx, ctx_state->flush_channel_func,
+                            1, 1, 1, 1, 1, 1, 0, nullptr, args,
+                            nullptr);
+        cudaDeviceSynchronize();
+        assert(cudaGetLastError() == cudaSuccess);
+    }
 
     /* Notify receiver thread and wait for receiver thread to
      * notify back */
