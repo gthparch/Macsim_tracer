@@ -35,26 +35,26 @@
 /* information collected in the instrumentation function and passed
  * on the channel from the GPU to the CPU */
 typedef struct {
-    uint64_t grid_launch_id;
-    int cta_id_x;
-    int cta_id_y;
-    int cta_id_z;
-    uint64_t warp_id;
-    int opcode_id;
-    uint64_t addrs[32];
+  uint64_t grid_launch_id;
+  int cta_id_x;
+  int cta_id_y;
+  int cta_id_z;
+  uint64_t warp_id;
+  int opcode_id;
+  uint64_t addrs[32];
 
-    int thread_id;
-    uint8_t size;
-    int32_t num_regs;
-    uint16_t reg_id[8];
-    uint32_t active_mask;
-    uint64_t func_addr;
-    uint64_t branch_target_addr;
-    uint64_t mem_addr;
-    uint8_t mem_access_size;
-    uint8_t m_addr_space;
-    /* 32 lanes, each thread can store up to 5 register values */
-    uint32_t reg_vals[32][8];
+  int thread_id;
+  uint8_t size;
+  int32_t num_regs;
+  uint16_t reg_id[8];
+  uint32_t active_mask;
+  uint64_t func_addr;
+  uint64_t branch_target_addr;
+  uint64_t mem_addr;
+  uint8_t mem_access_size;
+  uint8_t m_addr_space;
+  /* 32 lanes, each thread can store up to 5 register values */
+  // uint32_t reg_vals[32][8];
 } mem_access_t;
 
 typedef struct trace_info_nvbit_small_s {

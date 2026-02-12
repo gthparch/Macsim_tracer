@@ -643,8 +643,6 @@ void* recv_thread_fun(void* args) {
                     break;
                 }
 
-                std::stringstream ss;
-
                 int kernel_id = static_cast<int>(ma->grid_launch_id);
                 std::string kernel_name = "Kernel" + std::to_string(kernel_id);
                 std::string filename = "bin_trace_" + std::to_string(ma->warp_id) + ".txt";
