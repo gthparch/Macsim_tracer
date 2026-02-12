@@ -290,5 +290,15 @@ static const std::unordered_set<std::string> LD_SET = {
 };
 
 static const std::unordered_set<std::string> ST_SET = {
-    "ST", "STG", "STL", "STS"
+    "ST", "STG", "STL", "STS",
+    /* Hopper */ 
+    "STSM",
+};
+
+static const std::unordered_set<std::string> NO_DST_SET = {
+    "BRA", "EXIT", "BAR", "BSSY", "BSYNC", "CALL", "BREAK",
+    /* Hopper */ 
+    "FENCE", "LDGDEPBAR", "LDGSTS", "SYNCS", "REDAS", "REDG", "UCGABAR_ARV", "UCGABAR_WAIT", "USETMAXREG",
+    "WARPGROUP", "WARPGROUPSET", "UBLKCP", "UBLKPF", "UBLKRED", "UTMACCTL", "UTMACMDFLUSH", "UTMALDG", "UTMAPF", "UTMAREDG", "UTMASTG",
+    "ACQBULK", "CGAERRBAR", "ENDCOLLECTIVE", "PREEXIT",
 };
