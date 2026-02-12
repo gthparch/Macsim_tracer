@@ -61,6 +61,7 @@ TOOL_FUNC_SOURCES=$(wildcard tool_func/*.cu)
 OBJECTS=$(SOURCES:.cu=.o)
 TOOL_FUNC_FATBINS=$(TOOL_FUNC_SOURCES:.cu=.fatbin)
 TOOL_FUNC_BIN2CS=$(TOOL_FUNC_FATBINS:.fatbin=.c)
+HEADERS=$(wildcard *.h)
 ARCH?=all
 COMPRESS_TOOL=compress
 
@@ -80,10 +81,10 @@ tool_func/%.fatbin: tool_func/%.cu
 tool_func/%.c: tool_func/%.fatbin
 	$(BIN2C) -c --name $(basename $(notdir $<))_bin $< > $@
 
-%.o: %.cu $(TOOL_FUNC_BIN2CS)
+%.o: %.cu $(TOOL_FUNC_BIN2CS) $(HEADERS)
 	$(NVCC) -dc -c -std=c++11 $(INCLUDES) -Xptxas -cloning=no -Xcompiler -Wall -arch=$(ARCH) -O3 -Xcompiler -fPIC $< -o $@
 
-inject_funcs.o: inject_funcs.cu
+inject_funcs.o: inject_funcs.cu $(HEADERS)
 	$(NVCC) $(INCLUDES) $(MAXRREGCOUNT_FLAG) -Xptxas -astoolspatch --keep-device-functions -arch=$(ARCH) -Xcompiler -Wall -Xcompiler -fPIC -c $< -o $@
 
 $(COMPRESS_TOOL): compress.cc
