@@ -232,12 +232,10 @@ std::string cf_type(const std::string& opcode_short){
         return "NOT_CF";
 }
 
-uint8_t num_dst_reg(const std::string& opcode_short){
-    if (is_st(opcode_short) || opcode_short == "BRA" || opcode_short == "EXIT" || opcode_short == "BAR"
-                            || opcode_short == "BSSY" || opcode_short == "BSYNC" || opcode_short == "CALL"
-                            || opcode_short == "BREAK")
+uint8_t num_dst_reg(const std::string& opcode_short) {
+    if (is_st(opcode_short) || NO_DST_SET.count(opcode_short))
         return 0;
-    else 
+    else
         return 1;
 }
 
