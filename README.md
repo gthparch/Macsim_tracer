@@ -11,6 +11,8 @@ This tool is not yet stable, so please send me a teams message (Euijun Chung) if
 `git clone` and go to tools/main directory and `make`.
 You'll be able to see `main.so` if successfully compiled. 
 
+Run `ulimit -n 16384` before everything.
+
 ### Usage
 This tool works with any GPU programs including CUDA binaries and Tensorflow/Pytorch libraries.
 However, you should carefully choose the workload because even a very small workload can be too big for the tool to generate traces.

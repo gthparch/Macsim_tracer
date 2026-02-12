@@ -41,6 +41,7 @@
 #include <vector>
 #include <algorithm>
 #include <set>
+#include <list>
 #include <cuda_runtime.h>
 #include <cstdlib>
 #include <sys/stat.h>
@@ -63,6 +64,78 @@
 #define HEX(x)                                                            \
     "0x" << std::setfill('0') << std::setw(16) << std::hex << (uint64_t)x \
          << std::dec
+
+/* LRU file handle cache keyed by (kernel_id, warp_id) pair.
+ * Avoids string allocation and string hashing on the hot path.
+ * File path is only constructed on cache miss (when opening a new file). */
+
+struct FileKey {
+    int kernel_id;
+    uint64_t warp_id;
+    bool operator==(const FileKey& o) const {
+        return kernel_id == o.kernel_id && warp_id == o.warp_id;
+    }
+};
+
+struct FileKeyHash {
+    size_t operator()(const FileKey& k) const {
+        size_t h1 = std::hash<int>{}(k.kernel_id);
+        size_t h2 = std::hash<uint64_t>{}(k.warp_id);
+        return h1 ^ (h2 * 0x9e3779b97f4a7c15ULL + 0x9e3779b9 + (h1 << 6) + (h1 >> 2));
+    }
+};
+
+class LRUFileCache {
+public:
+    explicit LRUFileCache(size_t max_open, std::ios_base::openmode mode)
+        : max_open_(max_open), open_mode_(mode) {}
+
+    ~LRUFileCache() { close_all(); }
+
+    /* Get an open ofstream for the given (kernel_id, warp_id).
+     * path is only used on cache miss to open the file. */
+    std::ofstream& get(const FileKey& key, const char* path) {
+        auto it = cache_.find(key);
+        if (it != cache_.end()) {
+            /* Cache hit — move to front of LRU list */
+            lru_.splice(lru_.begin(), lru_, it->second.lru_it);
+            return it->second.stream;
+        }
+        /* Cache miss — evict if full */
+        if (cache_.size() >= max_open_) {
+            const FileKey& victim = lru_.back();
+            cache_[victim].stream.close();
+            cache_.erase(victim);
+            lru_.pop_back();
+        }
+        /* Open new file and insert at front */
+        lru_.push_front(key);
+        auto& entry = cache_[key];
+        entry.lru_it = lru_.begin();
+        entry.stream.open(path, open_mode_);
+        return entry.stream;
+    }
+
+    /* Close all cached file handles */
+    void close_all() {
+        for (auto& kv : cache_) {
+            if (kv.second.stream.is_open())
+                kv.second.stream.close();
+        }
+        cache_.clear();
+        lru_.clear();
+    }
+
+private:
+    struct Entry {
+        std::ofstream stream;
+        std::list<FileKey>::iterator lru_it;
+    };
+    size_t max_open_;
+    std::ios_base::openmode open_mode_;
+    std::list<FileKey> lru_;
+    std::unordered_map<FileKey, Entry, FileKeyHash> cache_;
+};
 
 #define CHANNEL_SIZE (1l << 30)
 
@@ -114,6 +187,10 @@ int overwrite = 0;
 /* opcode to id map and reverse map  */
 std::map<std::string, int> opcode_to_id_map;
 std::map<int, std::string> id_to_opcode_map;
+
+/* O(1) lookup tables for opcode/cf_type — built once in nvbit_at_init() */
+std::unordered_map<std::string, uint8_t> opcode_short_to_int;
+std::unordered_map<std::string, uint8_t> cf_type_to_int;
 
 /* grid launch id, incremented at every launch */
 uint64_t grid_launch_id = 0;
@@ -252,16 +329,21 @@ void dst_reg(mem_access_t* ma, uint8_t n_dst, uint16_t* dst_reg_){
 }
 
 /* Compute distinct 128B-aligned sector addresses touched by active threads.
- * Returns a sorted vector of sector start addresses. */
-std::vector<uint64_t> compute_coalesced_sectors(
-    uint64_t* mem_addrs, uint32_t active_mask) {
-    std::set<uint64_t> sectors;
+ * Fills the provided vector with sorted, unique sector start addresses.
+ * The caller should reuse the vector across calls (clear + refill). */
+void compute_coalesced_sectors(
+    uint64_t* mem_addrs, uint32_t active_mask,
+    std::vector<uint64_t>& out_sectors) {
+    out_sectors.clear();
     for (int i = 0; i < 32; i++) {
         if ((active_mask & (1u << i)) && mem_addrs[i] != 0) {
-            sectors.insert(mem_addrs[i] & ~(uint64_t)127);  // align down to 128B
+            uint64_t aligned = mem_addrs[i] & ~(uint64_t)127;
+            out_sectors.push_back(aligned);
         }
     }
-    return std::vector<uint64_t>(sectors.begin(), sectors.end());
+    /* Sort + deduplicate (at most 32 elements, very fast) */
+    std::sort(out_sectors.begin(), out_sectors.end());
+    out_sectors.erase(std::unique(out_sectors.begin(), out_sectors.end()), out_sectors.end());
 }
 
 void nvbit_at_init() {
@@ -295,6 +377,14 @@ void nvbit_at_init() {
     pthread_mutex_init(&file_mutex, &attr);
 
     trace_path = trace_path + "/";
+
+    /* Build O(1) lookup tables for opcode and cf_type */
+    for (int i = 0; i < (int)(sizeof(GPU_NVBIT_OPCODE) / sizeof(GPU_NVBIT_OPCODE[0])); i++) {
+        opcode_short_to_int[GPU_NVBIT_OPCODE[i]] = (uint8_t)i;
+    }
+    for (int i = 0; i < (int)(sizeof(CF_TYPE) / sizeof(CF_TYPE[0])); i++) {
+        cf_type_to_int[CF_TYPE[i]] = (uint8_t)i;
+    }
 
     create_a_directory(rm_bracket(trace_path), false);
 
@@ -626,6 +716,19 @@ void* recv_thread_fun(void* args) {
     pthread_mutex_unlock(&mutex);
     char* recv_buffer = (char*)malloc(CHANNEL_SIZE);
 
+    /* LRU file handle caches — avoid open/close syscalls per instruction */
+    LRUFileCache raw_cache(16384, std::ios::binary | std::ios_base::app);
+    LRUFileCache debug_cache(16384, std::ios_base::app);
+
+    /* Reusable buffers — allocated once, cleared each iteration */
+    std::vector<trace_info_nvbit_small_s> children_trace;
+    std::vector<uint64_t> sectors;
+    children_trace.reserve(32);
+    sectors.reserve(32);
+
+    /* Path buffer — avoids heap allocs for string concat */
+    char path_buf[512];
+
     while (ctx_state->recv_thread_done == CTXstate::RecvThreadState::WORKING) {
         /* receive buffer from channel */
         uint32_t num_recv_bytes = ch_host->recv(recv_buffer, CHANNEL_SIZE);
@@ -644,26 +747,32 @@ void* recv_thread_fun(void* args) {
                 }
 
                 int kernel_id = static_cast<int>(ma->grid_launch_id);
-                std::string kernel_name = "Kernel" + std::to_string(kernel_id);
-                std::string filename = "bin_trace_" + std::to_string(ma->warp_id) + ".txt";
-                std::string filename_raw = "bin_trace_" + std::to_string(ma->warp_id) + ".raw";
-                std::string opcode = id_to_opcode_map[ma->opcode_id];
+                const std::string& opcode = id_to_opcode_map[ma->opcode_id];
                 std::string opcode_short = get_opcode_short(opcode);
 
                 /* Increment instruction count for this warp */
                 store.instr_counts[kernel_id][ma->warp_id]++;
 
+                /* O(1) opcode lookup */
                 uint8_t opcode_int = 255;
-                auto it = std::find(std::begin(GPU_NVBIT_OPCODE), std::end(GPU_NVBIT_OPCODE), opcode_short);
-                if (it != std::end(GPU_NVBIT_OPCODE)) {
-                    opcode_int = (uint8_t)std::distance(std::begin(GPU_NVBIT_OPCODE), it);
+                auto opit = opcode_short_to_int.find(opcode_short);
+                if (opit != opcode_short_to_int.end()) {
+                    opcode_int = opit->second;
                 }
+
+                /* O(1) cf_type lookup */
                 uint8_t cf_type_int = 255;
                 std::string cf_type_str = cf_type(opcode_short);
-                auto it2 = std::find(std::begin(CF_TYPE), std::end(CF_TYPE), cf_type_str);
-                if (it2 != std::end(CF_TYPE)) {
-                    cf_type_int = (uint8_t)std::distance(std::begin(CF_TYPE), it2);
+                auto cfit = cf_type_to_int.find(cf_type_str);
+                if (cfit != cf_type_to_int.end()) {
+                    cf_type_int = cfit->second;
                 }
+
+                /* Cache is_ld / is_st results */
+                bool is_load = is_ld(opcode_short);
+                bool is_store = is_st(opcode_short);
+                bool is_mem = is_load || is_store;
+
                 uint8_t num_dst_reg_ = num_dst_reg(opcode_short);
                 uint8_t num_src_reg_ = ma->num_regs - num_dst_reg_;
                 if (ma->num_regs <= num_dst_reg_) num_src_reg_ = 0;
@@ -673,27 +782,23 @@ void* recv_thread_fun(void* args) {
                 memset(dst_reg_, 0, sizeof(dst_reg_));
                 src_reg(ma, num_dst_reg_, src_reg_);
                 dst_reg(ma, num_dst_reg_, dst_reg_);
-                uint8_t inst_size = ma->size; // always 4? 8?
+                uint8_t inst_size = ma->size;
                 uint32_t active_mask = ma->active_mask;
                 uint32_t br_taken_mask = 0; // should be added soon
                 uint64_t func_addr = ma->func_addr;
                 uint64_t br_target_addr = ma->branch_target_addr;
-                uint64_t mem_addr = (is_ld(opcode_short) || is_st(opcode_short)) ? ma->mem_addr : 0;
+                uint64_t mem_addr = is_mem ? ma->mem_addr : 0;
                 uint8_t mem_access_size = ma->mem_access_size;
                 uint16_t m_num_barrier_threads = 0;
                 uint8_t m_addr_space = ma->m_addr_space;
-                std::string m_addr_space_str = MemorySpaceStr[m_addr_space];
+                const char* m_addr_space_str = MemorySpaceStr[m_addr_space];
                 uint8_t m_cache_level = 0;
                 uint8_t m_cache_operator = 0;
-                uint64_t mem_addrs[32];
-                for (int i = 0; i < 32; i++) mem_addrs[i] = ma->addrs[i];
-                uint8_t active_threads = __builtin_popcount(active_mask);
 
-                
                 trace_info_nvbit_small_s cur_trace;
                 cur_trace.m_opcode = opcode_int;
                 cur_trace.m_is_fp = is_fp(opcode_short);
-                cur_trace.m_is_load = is_ld(opcode_short);
+                cur_trace.m_is_load = is_load;
                 cur_trace.m_cf_type = cf_type_int;
                 cur_trace.m_num_read_regs = num_src_reg_;
                 cur_trace.m_num_dest_regs = num_dst_reg_;
@@ -712,9 +817,9 @@ void* recv_thread_fun(void* args) {
                 cur_trace.m_cache_operator = m_cache_operator;
 
                 /* Compute 128B-aligned sectors touched by this warp instruction */
-                std::vector<trace_info_nvbit_small_s> children_trace;
-                if (is_ld(opcode_short) || is_st(opcode_short)) {
-                    std::vector<uint64_t> sectors = compute_coalesced_sectors(mem_addrs, active_mask);
+                children_trace.clear();
+                if (is_mem) {
+                    compute_coalesced_sectors(ma->addrs, active_mask, sectors);
                     int num_sectors = (int)sectors.size();
 
                     /* Parent trace gets the first sector address */
@@ -738,80 +843,84 @@ void* recv_thread_fun(void* args) {
                 }
 
                 pthread_mutex_lock(&file_mutex);
+                FileKey file_key = {kernel_id, ma->warp_id};
                 if (trace_debug != 0){
                     // Printing debug traces
-                    std::ofstream file(trace_path + kernel_name + "/" + filename, std::ios_base::app);
+                    snprintf(path_buf, sizeof(path_buf), "%sKernel%d/bin_trace_%lu.txt",
+                             trace_path.c_str(), kernel_id, (unsigned long)ma->warp_id);
+                    std::ofstream& file = debug_cache.get(file_key, path_buf);
                     if (!file.is_open()) {
-                        std::cerr << "Error: Failed to open file for writing: " << trace_path + kernel_name + "/" + filename << std::endl;
+                        std::cerr << "Error: Failed to open file for writing: " << path_buf << std::endl;
                         assert(0);
                     }
-                    file << opcode << std::endl;
-                    file << std::dec << is_fp(opcode_short) << std::endl;
-                    file << is_ld(opcode_short) << std::endl;
-                    file << cf_type_str << std::endl;
-                    file << (int)num_src_reg_ << std::endl;
-                    file << (int)num_dst_reg_ << std::endl;
-                    file << src_reg_[0] << std::endl;
-                    file << src_reg_[1] << std::endl;
-                    file << src_reg_[2] << std::endl;
-                    file << src_reg_[3] << std::endl;
-                    file << dst_reg_[0] << std::endl;
-                    file << dst_reg_[1] << std::endl;
-                    file << dst_reg_[2] << std::endl;
-                    file << dst_reg_[3] << std::endl;
-                    file << (int)inst_size << std::endl;
-                    file << std::hex << active_mask << std::endl;
-                    file << br_taken_mask << std::endl;
-                    file << func_addr << std::endl;
-                    file << br_target_addr << std::endl; 
-                    file << mem_addr << std::endl;
-                    file << (int)mem_access_size << std::endl;
-                    file << (int)m_num_barrier_threads << std::endl;
-                    file << m_addr_space_str << std::endl;
-                    file << (int)m_cache_level << std::endl;
-                    file << (int)m_cache_operator << std::endl;
-                    file << std::endl;
-                    if(is_ld(opcode_short) || is_st(opcode_short)) {
+                    file << opcode << '\n';
+                    file << std::dec << is_fp(opcode_short) << '\n';
+                    file << is_load << '\n';
+                    file << cf_type_str << '\n';
+                    file << (int)num_src_reg_ << '\n';
+                    file << (int)num_dst_reg_ << '\n';
+                    file << src_reg_[0] << '\n';
+                    file << src_reg_[1] << '\n';
+                    file << src_reg_[2] << '\n';
+                    file << src_reg_[3] << '\n';
+                    file << dst_reg_[0] << '\n';
+                    file << dst_reg_[1] << '\n';
+                    file << dst_reg_[2] << '\n';
+                    file << dst_reg_[3] << '\n';
+                    file << (int)inst_size << '\n';
+                    file << std::hex << active_mask << '\n';
+                    file << br_taken_mask << '\n';
+                    file << func_addr << '\n';
+                    file << br_target_addr << '\n';
+                    file << mem_addr << '\n';
+                    file << (int)mem_access_size << '\n';
+                    file << (int)m_num_barrier_threads << '\n';
+                    file << m_addr_space_str << '\n';
+                    file << (int)m_cache_level << '\n';
+                    file << (int)m_cache_operator << '\n';
+                    file << '\n';
+                    if(is_mem) {
                         for (int i = 0; i < (int)children_trace.size(); i++){
-                            file << opcode << " (child)" << std::endl;
-                            file << std::dec << is_fp(opcode_short) << std::endl;
-                            file << is_ld(opcode_short) << std::endl;
-                            file << cf_type_str << std::endl;
-                            file << (int)num_src_reg_ << std::endl;
-                            file << (int)num_dst_reg_ << std::endl;
-                            file << src_reg_[0] << std::endl;
-                            file << src_reg_[1] << std::endl;
-                            file << src_reg_[2] << std::endl;
-                            file << src_reg_[3] << std::endl;
-                            file << dst_reg_[0] << std::endl;
-                            file << dst_reg_[1] << std::endl;
-                            file << dst_reg_[2] << std::endl;
-                            file << dst_reg_[3] << std::endl;
-                            file << (int)inst_size << std::endl;
-                            file << std::hex << active_mask << std::endl;
-                            file << br_taken_mask << std::endl;
-                            file << func_addr << std::endl;
-                            file << br_target_addr << std::endl; 
-                            file << children_trace[i].m_mem_addr << std::endl;
-                            file << (int)mem_access_size << std::endl;
-                            file << (int)m_num_barrier_threads << std::endl;
-                            file << m_addr_space_str << std::endl;
-                            file << (int)m_cache_level << std::endl;
-                            file << (int)m_cache_operator << std::endl;
-                            file << std::endl;
+                            file << opcode << " (child)" << '\n';
+                            file << std::dec << is_fp(opcode_short) << '\n';
+                            file << is_load << '\n';
+                            file << cf_type_str << '\n';
+                            file << (int)num_src_reg_ << '\n';
+                            file << (int)num_dst_reg_ << '\n';
+                            file << src_reg_[0] << '\n';
+                            file << src_reg_[1] << '\n';
+                            file << src_reg_[2] << '\n';
+                            file << src_reg_[3] << '\n';
+                            file << dst_reg_[0] << '\n';
+                            file << dst_reg_[1] << '\n';
+                            file << dst_reg_[2] << '\n';
+                            file << dst_reg_[3] << '\n';
+                            file << (int)inst_size << '\n';
+                            file << std::hex << active_mask << '\n';
+                            file << br_taken_mask << '\n';
+                            file << func_addr << '\n';
+                            file << br_target_addr << '\n';
+                            file << children_trace[i].m_mem_addr << '\n';
+                            file << (int)mem_access_size << '\n';
+                            file << (int)m_num_barrier_threads << '\n';
+                            file << m_addr_space_str << '\n';
+                            file << (int)m_cache_level << '\n';
+                            file << (int)m_cache_operator << '\n';
+                            file << '\n';
                         }
                     }
-                    file.close();
                 }
 
-                std::ofstream file_raw(trace_path + kernel_name + "/" + filename_raw, std::ios::binary | std::ios_base::app);
+                snprintf(path_buf, sizeof(path_buf), "%sKernel%d/bin_trace_%lu.raw",
+                         trace_path.c_str(), kernel_id, (unsigned long)ma->warp_id);
+                std::ofstream& file_raw = raw_cache.get(file_key, path_buf);
                 if (!file_raw.is_open()) {
-                    std::cerr << "Error: Failed to open file for writing: " << trace_path + kernel_name + "/" + filename_raw << std::endl;
+                    std::cerr << "Error: Failed to open file for writing: " << path_buf << std::endl;
                     assert(0);
                 }
                 file_raw.write(reinterpret_cast<const char*>(&cur_trace), sizeof(cur_trace));
                 
-                if(is_ld(opcode_short) || is_st(opcode_short)) {
+                if(is_mem) {
                     for (int i = 0; i < (int)children_trace.size(); i++){
                         file_raw.write(reinterpret_cast<const char*>(&children_trace[i]), sizeof(children_trace[i]));
                         auto itt = store.instr_counts[kernel_id].find(ma->warp_id);
@@ -820,13 +929,15 @@ void* recv_thread_fun(void* args) {
                         }
                     }
                 }
-
-                file_raw.close();
                 pthread_mutex_unlock(&file_mutex);
                 num_processed_bytes += sizeof(mem_access_t);
             }
         }
     }
+
+    /* Flush and close all cached file handles before writing trace metadata */
+    raw_cache.close_all();
+    debug_cache.close_all();
 
     store.write_trace_files();
 
