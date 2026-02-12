@@ -286,7 +286,9 @@ static const std::unordered_set<std::string> FP_SET = {
 };
 
 static const std::unordered_set<std::string> LD_SET = {
-    "LD", "LDC", "LDG", "LDL", "LDS", "LDSM"
+    "LD", "LDC", "LDG", "LDL", "LDS", "LDSM",
+    /* Ampere */
+    "LDGSTS",
 };
 
 static const std::unordered_set<std::string> ST_SET = {

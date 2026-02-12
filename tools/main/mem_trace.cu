@@ -450,11 +450,19 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func) {
                 nvbit_get_func_addr(ctx, func) + instr->getOffset() + 0x10;
             nvbit_add_call_arg_const_val64(instr, branchAddrOffset);
             /* MEM access address / reconv(??) address */
-            nvbit_add_call_arg_mref_addr64(instr);
+            /* LDGSTS (cp.async) has 2 MREFs in SASS order: [shared_dst], [global_src]
+             *   MREF id=0 → shared (destination)
+             *   MREF id=1 → global (source)
+             * We trace only the global memory access and report the space as GLOBAL. */
+            std::string opcode_str(instr->getOpcode());
+            bool is_ldgsts = (opcode_str.find("LDGSTS") != std::string::npos);
+            nvbit_add_call_arg_mref_addr64(instr, is_ldgsts ? 1 : 0);
             /* MEM access size */
             nvbit_add_call_arg_const_val32(instr, (uint8_t)instr->getSize()); 
-            /* MEM addr space */
-            nvbit_add_call_arg_const_val32(instr, (uint8_t)instr->getMemorySpace());
+            /* MEM addr space — override GLOBAL_TO_SHARED → GLOBAL for LDGSTS */
+            nvbit_add_call_arg_const_val32(instr,
+                is_ldgsts ? (uint8_t)InstrType::MemorySpace::GLOBAL
+                          : (uint8_t)instr->getMemorySpace());
             /* how many register values are passed next */
             nvbit_add_call_arg_const_val32(instr, (int)reg_num_list.size());
 
@@ -485,8 +493,38 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
     CTXstate* ctx_state = ctx_state_map[ctx];
 
     if (cbid == API_CUDA_cuLaunchKernel_ptsz ||
-        cbid == API_CUDA_cuLaunchKernel) {
-        cuLaunchKernel_params* p = (cuLaunchKernel_params*)params;
+        cbid == API_CUDA_cuLaunchKernel ||
+        cbid == API_CUDA_cuLaunchKernelEx_ptsz ||
+        cbid == API_CUDA_cuLaunchKernelEx) {
+
+        /* Extract launch parameters from the appropriate struct */
+        CUfunction func;
+        unsigned int gridDimX, gridDimY, gridDimZ;
+        unsigned int blockDimX, blockDimY, blockDimZ;
+        unsigned int sharedMemBytes;
+
+        if (cbid == API_CUDA_cuLaunchKernelEx_ptsz ||
+            cbid == API_CUDA_cuLaunchKernelEx) {
+            cuLaunchKernelEx_params* p = (cuLaunchKernelEx_params*)params;
+            func = p->f;
+            gridDimX = p->config->gridDimX;
+            gridDimY = p->config->gridDimY;
+            gridDimZ = p->config->gridDimZ;
+            blockDimX = p->config->blockDimX;
+            blockDimY = p->config->blockDimY;
+            blockDimZ = p->config->blockDimZ;
+            sharedMemBytes = p->config->sharedMemBytes;
+        } else {
+            cuLaunchKernel_params* p = (cuLaunchKernel_params*)params;
+            func = p->f;
+            gridDimX = p->gridDimX;
+            gridDimY = p->gridDimY;
+            gridDimZ = p->gridDimZ;
+            blockDimX = p->blockDimX;
+            blockDimY = p->blockDimY;
+            blockDimZ = p->blockDimZ;
+            sharedMemBytes = p->sharedMemBytes;
+        }
 
         /* Make sure GPU is idle */
         cudaDeviceSynchronize();
@@ -501,33 +539,33 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
             ctx_state->need_sync = true;
 
             /* instrument */
-            instrument_function_if_needed(ctx, p->f);
+            instrument_function_if_needed(ctx, func);
 
             int nregs = 0;
             CUDA_SAFECALL(
-                cuFuncGetAttribute(&nregs, CU_FUNC_ATTRIBUTE_NUM_REGS, p->f));
+                cuFuncGetAttribute(&nregs, CU_FUNC_ATTRIBUTE_NUM_REGS, func));
 
             int shmem_static_nbytes = 0;
             CUDA_SAFECALL(
                 cuFuncGetAttribute(&shmem_static_nbytes,
-                                   CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, p->f));
+                                   CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, func));
 
             /* get function name and pc */
-            uint64_t pc = nvbit_get_func_addr(ctx, p->f);
+            uint64_t pc = nvbit_get_func_addr(ctx, func);
 
             /* set grid launch id at launch time */
-            nvbit_set_at_launch(ctx, p->f, (uint64_t)grid_launch_id);
+            nvbit_set_at_launch(ctx, func, (uint64_t)grid_launch_id);
 
             /* enable instrumented code to run */
-            nvbit_enable_instrumented(ctx, p->f, false);
+            nvbit_enable_instrumented(ctx, func, false);
 
             /* Making proper directories for trace files */
-            std::string func_name = nvbit_get_func_name(ctx, p->f); // this function fetches the argument part too..
+            std::string func_name = nvbit_get_func_name(ctx, func); // this function fetches the argument part too..
             int kernel_id = store.add(rm_bracket(func_name));
             
             int numBlocks;
             CUresult result;
-            result = cuOccupancyMaxActiveBlocksPerMultiprocessor(&numBlocks, p->f, p->blockDimX * p->blockDimY * p->blockDimZ, p->sharedMemBytes); 
+            result = cuOccupancyMaxActiveBlocksPerMultiprocessor(&numBlocks, func, blockDimX * blockDimY * blockDimZ, sharedMemBytes); 
             if (result != CUDA_SUCCESS) {
                 const char* pStr = NULL; // Pointer to store the error string
                 cuGetErrorString(result, &pStr);
@@ -545,7 +583,7 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
 
             if ((found || sampled_kernel_ids.empty()) && within_range) {
                 std::string kernel_dir = trace_path + "Kernel" + std::to_string(grid_launch_id);
-                nvbit_enable_instrumented(ctx, p->f, true);
+                nvbit_enable_instrumented(ctx, func, true);
 
                 create_a_directory(kernel_dir, false);
 
@@ -563,10 +601,10 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
 
             std::ofstream file_kernel_names(trace_path + "kernel_names.txt", std::ios_base::app);
             file_kernel_names << "Kernel" << grid_launch_id << " name: " << func_name.c_str() << std::endl <<
-            "  Grid size: (" << p->gridDimX << ", " << p->gridDimY << ", " << p->gridDimZ << "), " <<
-            "Block size: (" << p->blockDimX << ", " << p->blockDimY << ", " << p->blockDimZ << "), " <<
+            "  Grid size: (" << gridDimX << ", " << gridDimY << ", " << gridDimZ << "), " <<
+            "Block size: (" << blockDimX << ", " << blockDimY << ", " << blockDimZ << "), " <<
             "maxBlockPerCore: " << numBlocks <<
-            ", # of regs: " << nregs << ", static shared mem: " << shmem_static_nbytes << ", dynamic shared mem: " << p->sharedMemBytes << std::endl;
+            ", # of regs: " << nregs << ", static shared mem: " << shmem_static_nbytes << ", dynamic shared mem: " << sharedMemBytes << std::endl;
 
             /* increment grid launch id for next launch */
             grid_launch_id++;
