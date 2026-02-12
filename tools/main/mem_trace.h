@@ -64,6 +64,7 @@ static const std::string CF_TYPE[] = {
 };
 
 static const std::string GPU_NVBIT_OPCODE[] = {
+    /* Turing architecture instructions */
     "FADD",
     "FADD32I",
     "FCHK",
@@ -226,7 +227,52 @@ static const std::string GPU_NVBIT_OPCODE[] = {
     "S2R",
     "SETCTAID",
     "SETLMEMBASE",
-    "VOTE"
+    "VOTE",
+
+    /* Hopper architecture instructions */
+    "HMNMX2",
+    "DMMA",
+    "VHMNMX",
+    "VIADD",
+    "VIADDMNMX",
+    "VIMNMX",
+    "VIMNMX3",
+    "I2FP",
+    "F2IP",
+    "FENCE",
+    "LDGDEPBAR",
+    "LDGMC",
+    "LDGSTS",   
+    "STSM",   
+    "SYNCS",
+    "REDAS",
+    "REDG",
+    "REDUX",
+    "UCGABAR_ARV",
+    "UCGABAR_WAIT",
+    "UF2FP",
+    "ULEPC",
+    "USETMAXREG",
+    "BGMMA",
+    "HGMMA",
+    "IGMMA",
+    "QGMMA",
+    "WARPGROUP",
+    "WARPGROUPSET",
+    "UBLKCP",
+    "UBLKPF",
+    "UBLKRED",
+    "UTMACCTL",
+    "UTMACMDFLUSH",
+    "UTMALDG",
+    "UTMAPF",
+    "UTMAREDG",
+    "UTMASTG",
+    "ACQBULK",
+    "CGAERRBAR",
+    "ELECT",
+    "ENDCOLLECTIVE",
+    "PREEXIT",
 };
 
 /* OPCODE classification sets — using unordered_set for O(1) lookup */
@@ -235,7 +281,8 @@ static const std::unordered_set<std::string> FP_SET = {
     "FMUL", "FMUL32I", "FSEL", "FSET", "FSETP", "FSWZADD",
     "MUFU", "HADD2", "HADD2_32I", "HFMA2", "HFMA2_32I", "HMMA",
     "HMUL2", "HMUL2_32I", "HSET2", "HSETP2",
-    "DADD", "DFMA", "DMUL", "DSETP"
+    "DADD", "DFMA", "DMUL", "DSETP",
+    "HMNMX2", "DMMA",
 };
 
 static const std::unordered_set<std::string> LD_SET = {
