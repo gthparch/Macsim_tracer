@@ -791,7 +791,6 @@ void* recv_thread_fun(void* args) {
                 uint8_t mem_access_size = ma->mem_access_size;
                 uint16_t m_num_barrier_threads = 0;
                 uint8_t m_addr_space = ma->m_addr_space;
-                const char* m_addr_space_str = MemorySpaceStr[m_addr_space];
                 uint8_t m_cache_level = 0;
                 uint8_t m_cache_operator = 0;
 
