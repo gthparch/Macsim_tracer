@@ -854,7 +854,7 @@ void* recv_thread_fun(void* args) {
                         std::cerr << "Error: Failed to open file for writing: " << path_buf << std::endl;
                         assert(0);
                     }
-                    file << id_to_opcode_map[cur_trace.m_opcode] << '\n';
+                    file << id_to_opcode_map[ma->opcode_id] << '\n';
                     file << std::dec << cur_trace.m_is_fp << '\n';
                     file << std::dec << cur_trace.m_is_load << '\n';
                     file << CF_TYPE[cur_trace.m_cf_type] << '\n';
@@ -882,7 +882,7 @@ void* recv_thread_fun(void* args) {
                     file << '\n';
                     if(is_mem) {
                         for (int i = 0; i < (int)children_trace.size(); i++){
-                            file << id_to_opcode_map[children_trace[i].m_opcode] << " (child)" << '\n';
+                            file << id_to_opcode_map[ma->opcode_id] << " (child)" << '\n';
                             file << std::dec << children_trace[i].m_is_fp << '\n';
                             file << std::dec << children_trace[i].m_is_load << '\n';
                             file << CF_TYPE[children_trace[i].m_cf_type] << '\n';
