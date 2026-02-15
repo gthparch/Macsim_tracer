@@ -13,6 +13,10 @@ You'll be able to see `main.so` if successfully compiled.
 
 Run `ulimit -n 16384` before everything.
 
+Memory access coalescing is already implemented in this tracer, so you should not use `mem_access_size` in your simulator!!! For simplicity, just assume every memory request size is 128B unless you implement sector cache in L2$. 
+
+if is_fp and is_ld are both set to True, the ld is child; meaning it's a coalesced request following parent ld instruction.
+
 ### Usage
 This tool works with any GPU programs including CUDA binaries and Tensorflow/Pytorch libraries.
 However, you should carefully choose the workload because even a very small workload can be too big for the tool to generate traces.

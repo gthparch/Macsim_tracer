@@ -832,6 +832,7 @@ void* recv_thread_fun(void* args) {
                         trace_info_nvbit_small_s child_trace;
                         memcpy(&child_trace, &cur_trace, sizeof(child_trace));
                         child_trace.m_mem_addr = sectors[i];
+                        child_trace.m_is_fp = true;
                         children_trace.push_back(child_trace);
                     }
 
