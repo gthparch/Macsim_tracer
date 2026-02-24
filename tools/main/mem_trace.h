@@ -289,12 +289,19 @@ static const std::unordered_set<std::string> LD_SET = {
     "LD", "LDC", "LDG", "LDL", "LDS", "LDSM",
     /* Ampere */
     "LDGSTS",
+    /* Hopper TMA */
+    "UTMALDG",
 };
 
 static const std::unordered_set<std::string> ST_SET = {
     "ST", "STG", "STL", "STS",
     /* Hopper */ 
     "STSM",
+};
+
+static const std::unordered_set<std::string> BARRIER_SET = {
+    "BAR",    /* classic warp barrier (__syncthreads) */
+    "SYNCS",  /* mbarrier (async barrier for TMA, etc.) */
 };
 
 static const std::unordered_set<std::string> NO_DST_SET = {

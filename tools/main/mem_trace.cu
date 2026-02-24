@@ -45,6 +45,8 @@
 #include <cuda_runtime.h>
 #include <cstdlib>
 #include <sys/stat.h>
+#include <fcntl.h>
+#include <sys/mman.h>
 
 /* every tool needs to include this once */
 #include "nvbit_tool.h"
@@ -183,6 +185,7 @@ uint32_t kernel_end_interval = UINT32_MAX;
 int verbose = 0;
 int trace_debug = 0;
 int overwrite = 0;
+int tma_trace_enabled = 0;  /* TMA_TRACE: write extended trace_info_tma_s */
 
 /* opcode to id map and reverse map  */
 std::map<std::string, int> opcode_to_id_map;
@@ -194,6 +197,67 @@ std::unordered_map<std::string, uint8_t> cf_type_to_int;
 
 /* grid launch id, incremented at every launch */
 uint64_t grid_launch_id = 0;
+
+/* TMA descriptor cache: populated at kernel launch time by reading
+ * CUtensorMap kernel arguments.  Key = grid_launch_id.
+ * Value = vector of {globalAddress, tileBytes} for each TMA descriptor. */
+struct TmaDescInfo {
+    uint64_t global_addr;
+    uint32_t tile_bytes;
+    uint32_t element_size;  /* bytes per element (e.g. 4 for float32) */
+};
+
+/* Map CU_TENSOR_MAP_DATA_TYPE enum (from descriptor config word) to byte size */
+static uint32_t tma_dtype_to_bytes(uint32_t dtype_enum) {
+    switch (dtype_enum) {
+        case 0:  return 1;  /* UINT8 */
+        case 1:  return 2;  /* UINT16 */
+        case 2:  return 4;  /* UINT32 */
+        case 3:  return 4;  /* INT32 */
+        case 4:  return 8;  /* UINT64 */
+        case 5:  return 8;  /* INT64 */
+        case 6:  return 2;  /* FLOAT16 */
+        case 7:  return 4;  /* FLOAT32 */
+        case 8:  return 8;  /* FLOAT64 */
+        case 9:  return 2;  /* BFLOAT16 */
+        case 10: return 4;  /* FLOAT32_FTZ */
+        case 11: return 4;  /* TFLOAT32 */
+        case 12: return 4;  /* TFLOAT32_FTZ */
+        default: return 4;  /* assume 4 as fallback */
+    }
+}
+std::unordered_map<uint64_t, std::vector<TmaDescInfo>> tma_desc_by_launch;
+
+/* Per-launch kernel info: block dimensions needed for barrier thread count */
+struct KernelLaunchInfo {
+    uint32_t block_dim_x;
+    uint32_t block_dim_y;
+    uint32_t block_dim_z;
+    uint32_t total_threads_per_block() const {
+        return block_dim_x * block_dim_y * block_dim_z;
+    }
+};
+std::unordered_map<uint64_t, KernelLaunchInfo> launch_info_by_id;
+
+/* Count the number of commas in a function signature to estimate the number
+ * of kernel parameters.  E.g. "kernel(float*, int, CUtensorMap)" → 3 params
+ * (2 commas + 1).  Returns 0 if no parenthesis is found. */
+static int count_kernel_params(const std::string& func_name) {
+    size_t lp = func_name.find('(');
+    size_t rp = func_name.rfind(')');
+    if (lp == std::string::npos || rp == std::string::npos || rp <= lp + 1)
+        return 0;
+    std::string args = func_name.substr(lp + 1, rp - lp - 1);
+    if (args.empty() || args == "void") return 0;
+    int count = 1;
+    int depth = 0;
+    for (char c : args) {
+        if (c == '<' || c == '(') depth++;
+        else if (c == '>' || c == ')') depth--;
+        else if (c == ',' && depth == 0) count++;
+    }
+    return count;
+}
 
 /* Trace file path */
 std::string trace_path = "./default/";
@@ -366,6 +430,7 @@ void nvbit_at_init() {
     GET_VAR_INT(trace_debug, "DEBUG_TRACE", 0, "Generate human-readable debug traces together");
     GET_VAR_INT(overwrite, "OVERWRITE", 0, "Overwrite the previously generated traces in TRACE_PATH directory");
     GET_VAR_STR(sampled_kernel_path, "SAMPLED_KERNEL_INFO", "Path to the file that contains the list of kernels to be sampled. Default: ''");
+    GET_VAR_INT(tma_trace_enabled, "TMA_TRACE", 0, "Write extended TMA traces (trace_info_tma_s) to trace_tma_*.raw files for UTMALDG instructions");
     std::string pad(100, '-');
     printf("%s\n", pad.c_str());
 
@@ -446,8 +511,34 @@ void nvbit_at_init() {
     }
 }
 
+/* Parse TMA load size from SASS opcode modifier string.
+ * Looks for ".LxxxB" pattern (e.g. ".L128B" -> 128, ".L64B" -> 64).
+ * If no size modifier is found (e.g. "UTMALDG.1D"), returns 128 — the
+ * standard TMA tile transfer size.  The actual size is determined by the
+ * CUtensorMap descriptor at runtime and cannot be read statically. */
+static uint32_t parse_tma_load_size(const std::string& opcode) {
+    size_t pos = opcode.find(".L");
+    while (pos != std::string::npos) {
+        size_t b_pos = opcode.find('B', pos + 2);
+        if (b_pos != std::string::npos) {
+            std::string num_str = opcode.substr(pos + 2, b_pos - pos - 2);
+            if (!num_str.empty() && std::all_of(num_str.begin(), num_str.end(), ::isdigit)) {
+                int size = std::stoi(num_str);
+                if (size > 0) return (uint32_t)size;
+            }
+        }
+        pos = opcode.find(".L", pos + 2);
+    }
+    return 128; // TMA tile default (actual size is in the tensor descriptor)
+}
+
 /* Set used to avoid re-instrumenting the same functions multiple times */
 std::unordered_set<CUfunction> already_instrumented;
+
+/* Functions whose SASS contains UTMALDG (TMA load) instructions.
+ * Populated during instrumentation, checked at launch to avoid
+ * false-positive CUtensorMap descriptor scans on non-TMA kernels. */
+std::unordered_set<CUfunction> functions_with_tma;
 
 /* Kernel - id mapping */
 UniqueKernelStore store;
@@ -543,16 +634,33 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func) {
             /* LDGSTS (cp.async) has 2 MREFs in SASS order: [shared_dst], [global_src]
              *   MREF id=0 → shared (destination)
              *   MREF id=1 → global (source)
+             * UTMALDG (TMA load) similarly loads from global to shared via a
+             * tensor descriptor. MREF id=1 is the global-side address.
              * We trace only the global memory access and report the space as GLOBAL. */
             std::string opcode_str(instr->getOpcode());
             bool is_ldgsts = (opcode_str.find("LDGSTS") != std::string::npos);
-            nvbit_add_call_arg_mref_addr64(instr, is_ldgsts ? 1 : 0);
-            /* MEM access size */
-            nvbit_add_call_arg_const_val32(instr, (uint8_t)instr->getSize()); 
-            /* MEM addr space — override GLOBAL_TO_SHARED → GLOBAL for LDGSTS */
+            bool is_utmaldg = (opcode_str.find("UTMALDG") != std::string::npos);
+            if (is_utmaldg) functions_with_tma.insert(f);
+            bool needs_global_override = is_ldgsts || is_utmaldg;
+
+            /* For UTMALDG, find the coordinate UREG from the descriptor MREF.
+             * SASS format: UTMALDG.1D ... desc[URdesc][URcoord]
+             * The second MREF (global source) has has_ur=true, ur_num=coord reg. */
+            /* Note: NVBit collapses desc[URbase][URcoord] into a single
+             * [UR] MREF, so the coordinate UREG is not directly accessible
+             * through the operand API.  Per-tile address is computed in
+             * recv_thread_fun using cta_id_x * tile_bytes instead. */
+
+            nvbit_add_call_arg_mref_addr64(instr, needs_global_override ? 1 : 0);
+            /* MEM access size — parse from SASS modifier for UTMALDG (e.g. .L128B),
+             * otherwise use the instruction encoding size */
+            uint32_t access_size = is_utmaldg ? parse_tma_load_size(opcode_str)
+                                              : (uint32_t)instr->getSize();
+            nvbit_add_call_arg_const_val32(instr, access_size);
+            /* MEM addr space — override to GLOBAL for LDGSTS and UTMALDG */
             nvbit_add_call_arg_const_val32(instr,
-                is_ldgsts ? (uint8_t)InstrType::MemorySpace::GLOBAL
-                          : (uint8_t)instr->getMemorySpace());
+                needs_global_override ? (uint8_t)InstrType::MemorySpace::GLOBAL
+                                      : (uint8_t)instr->getMemorySpace());
             /* how many register values are passed next */
             nvbit_add_call_arg_const_val32(instr, (int)reg_num_list.size());
 
@@ -592,6 +700,7 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
         unsigned int gridDimX, gridDimY, gridDimZ;
         unsigned int blockDimX, blockDimY, blockDimZ;
         unsigned int sharedMemBytes;
+        void** kernelParams = nullptr;
 
         if (cbid == API_CUDA_cuLaunchKernelEx_ptsz ||
             cbid == API_CUDA_cuLaunchKernelEx) {
@@ -604,6 +713,7 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
             blockDimY = p->config->blockDimY;
             blockDimZ = p->config->blockDimZ;
             sharedMemBytes = p->config->sharedMemBytes;
+            kernelParams = p->kernelParams;
         } else {
             cuLaunchKernel_params* p = (cuLaunchKernel_params*)params;
             func = p->f;
@@ -614,6 +724,7 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
             blockDimY = p->blockDimY;
             blockDimZ = p->blockDimZ;
             sharedMemBytes = p->sharedMemBytes;
+            kernelParams = p->kernelParams;
         }
 
         /* Make sure GPU is idle */
@@ -696,6 +807,81 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
             "maxBlockPerCore: " << numBlocks <<
             ", # of regs: " << nregs << ", static shared mem: " << shmem_static_nbytes << ", dynamic shared mem: " << sharedMemBytes << std::endl;
 
+            /* Scan kernel arguments for CUtensorMap descriptors (128 bytes).
+             * Extract globalAddress and tileBytes for TMA trace resolution.
+             *
+             * cuFuncGetParamInfo() fails on NVBit-instrumented handles, so we
+             * heuristically scan kernelParams[0..N-1] looking for entries whose
+             * first 8 bytes resemble a GPU device pointer (non-zero, high bits
+             * set) and whose bytes 64-67 are a plausible tile size.  Each
+             * kernelParams[i] points to the host-side copy of the i-th arg. */
+            if (kernelParams && functions_with_tma.count(func)) {
+                std::vector<TmaDescInfo> descs;
+                /* Determine the number of kernel parameters from the
+                 * demangled function signature (avoids unsafe pointer probing). */
+                int nparams = count_kernel_params(func_name);
+                for (int pi = 0; pi < nparams; pi++) {
+                    void* arg_ptr = kernelParams[pi];
+                    if (!arg_ptr) continue;
+                    /* Try to read first 8 bytes as a potential globalAddress */
+                    uint64_t potential_addr;
+                    memcpy(&potential_addr, arg_ptr, sizeof(uint64_t));
+                    /* A GPU device pointer on Hopper typically has high bits;
+                     * rule out small integers (plain scalar args) and NULL. */
+                    if (potential_addr < 0x100000000ULL) continue;
+                    /* Read offset 64: tile_bytes */
+                    uint32_t potential_tb;
+                    memcpy(&potential_tb, (const uint8_t*)arg_ptr + 64, sizeof(uint32_t));
+                    /* Sanity: tileBytes should be between 16 and 65536 (max
+                     * shared memory) and a multiple of 16 (TMA alignment).
+                     * Note: 2D tiles are NOT necessarily power-of-two. */
+                    if (potential_tb < 16 || potential_tb > 65536) continue;
+                    if ((potential_tb % 16) != 0) continue;
+                    /* Extra check: offset 8 should hold the config/stride word
+                     * which encodes dataType in bits [9:7].  For a valid descriptor
+                     * the whole 64-bit word at offset 8 should be non-zero. */
+                    uint64_t config_word;
+                    memcpy(&config_word, (const uint8_t*)arg_ptr + 8, sizeof(uint64_t));
+                    if (config_word == 0) continue;
+                    /* Looks like a CUtensorMap — extract info */
+                    uint32_t config32;
+                    memcpy(&config32, (const uint8_t*)arg_ptr + 8, sizeof(uint32_t));
+                    uint32_t dtype_enum = (config32 >> 7) & 0xF;
+                    TmaDescInfo info;
+                    info.global_addr = potential_addr;
+                    info.tile_bytes = potential_tb;
+                    info.element_size = tma_dtype_to_bytes(dtype_enum);
+                    descs.push_back(info);
+                    if (verbose) {
+                        fprintf(stderr, "TMA_DBG: Kernel%lu desc[%zu]: globalAddr=0x%lx tileBytes=%u elemSize=%u (param %d)\n",
+                                (unsigned long)grid_launch_id, descs.size()-1,
+                                (unsigned long)info.global_addr, info.tile_bytes,
+                                info.element_size, pi);
+                    }
+                }
+                if (!descs.empty()) {
+                    tma_desc_by_launch[grid_launch_id] = std::move(descs);
+                    if (!tma_trace_enabled) {
+                        static bool warned_once = false;
+                        if (!warned_once) {
+                            fprintf(stderr,
+                                "WARNING: TMA (UTMALDG) instructions detected but TMA_TRACE=0.\n"
+                                "  Using old trace format (trace_info_nvbit_small_s) which caps\n"
+                                "  mem_access_size at 255 bytes. Set TMA_TRACE=1 to write extended\n"
+                                "  TMA traces (trace_info_tma_s) with full-size access tracking.\n");
+                            warned_once = true;
+                        }
+                    }
+                }
+            }
+
+            /* Store block dimensions for barrier thread count resolution */
+            KernelLaunchInfo launch_info;
+            launch_info.block_dim_x = blockDimX;
+            launch_info.block_dim_y = blockDimY;
+            launch_info.block_dim_z = blockDimZ;
+            launch_info_by_id[grid_launch_id] = launch_info;
+
             /* increment grid launch id for next launch */
             grid_launch_id++;
         }
@@ -714,6 +900,7 @@ void* recv_thread_fun(void* args) {
 
     ChannelHost* ch_host = &ctx_state->channel_host;
     pthread_mutex_unlock(&mutex);
+
     char* recv_buffer = (char*)malloc(CHANNEL_SIZE);
 
     /* LRU file handle caches — avoid open/close syscalls per instruction */
@@ -727,7 +914,7 @@ void* recv_thread_fun(void* args) {
     sectors.reserve(32);
 
     /* Path buffer — avoids heap allocs for string concat */
-    char path_buf[512];
+    char path_buf[1024];
 
     while (ctx_state->recv_thread_done == CTXstate::RecvThreadState::WORKING) {
         /* receive buffer from channel */
@@ -747,6 +934,12 @@ void* recv_thread_fun(void* args) {
                 }
 
                 int kernel_id = static_cast<int>(ma->grid_launch_id);
+                /* Guard against overflow: if grid_launch_id exceeds INT_MAX
+                 * the cast wraps negative, or the id may exceed store size. */
+                if (kernel_id < 0 || kernel_id >= (int)store.kernels.size()) {
+                    num_processed_bytes += sizeof(mem_access_t);
+                    continue;
+                }
                 const std::string& opcode = id_to_opcode_map[ma->opcode_id];
                 std::string opcode_short = get_opcode_short(opcode);
 
@@ -774,8 +967,9 @@ void* recv_thread_fun(void* args) {
                 bool is_mem = is_load || is_store;
 
                 uint8_t num_dst_reg_ = num_dst_reg(opcode_short);
-                uint8_t num_src_reg_ = ma->num_regs - num_dst_reg_;
-                if (ma->num_regs <= num_dst_reg_) num_src_reg_ = 0;
+                uint8_t num_src_reg_ = 0;
+                if (ma->num_regs > num_dst_reg_)
+                    num_src_reg_ = ma->num_regs - num_dst_reg_;
                 uint16_t src_reg_[MAX_GPU_SRC_NUM];
                 uint16_t dst_reg_[MAX_GPU_DST_NUM];
                 memset(src_reg_, 0, sizeof(src_reg_));
@@ -789,8 +983,27 @@ void* recv_thread_fun(void* args) {
                 uint64_t br_target_addr = ma->branch_target_addr;
                 uint64_t mem_addr = is_mem ? ma->mem_addr : 0;
                 uint8_t mem_access_size = ma->mem_access_size;
-                uint16_t m_num_barrier_threads = 0;
                 uint8_t m_addr_space = ma->m_addr_space;
+
+                /* Barrier metadata: populate for BAR and SYNCS (mbarrier) */
+                bool is_barrier = BARRIER_SET.count(opcode_short) > 0;
+                uint16_t m_num_barrier_threads = 0;
+                if (is_barrier) {
+                    if (opcode_short == "BAR") {
+                        /* BAR.SYNC / BAR.SYNC.DEFER_BLOCKING: all threads in
+                         * the block must arrive.  Look up block dimensions
+                         * from the kernel launch info. */
+                        auto lit = launch_info_by_id.find(ma->grid_launch_id);
+                        if (lit != launch_info_by_id.end()) {
+                            uint32_t total = lit->second.total_threads_per_block();
+                            m_num_barrier_threads = (total <= 0xFFFF) ? (uint16_t)total : 0xFFFF;
+                        }
+                    }
+                    /* SYNCS (mbarrier): async barrier — the arrival count is
+                     * set at runtime via mbarrier.init and is not statically
+                     * known.  Leave m_num_barrier_threads = 0 to indicate
+                     * "async / unknown count" to the simulator. */
+                }
                 uint8_t m_cache_level = 0;
                 uint8_t m_cache_operator = 0;
 
@@ -817,7 +1030,51 @@ void* recv_thread_fun(void* args) {
 
                 /* Compute 128B-aligned sectors touched by this warp instruction */
                 children_trace.clear();
-                if (is_mem) {
+                bool is_tma_load = (opcode_short == "UTMALDG");
+                /* TMA trace: built separately with int access size */
+                trace_info_tma_s tma_trace;
+                int tma_access_size = 0;
+                if (is_mem && is_tma_load) {
+                    /* TMA (UTMALDG): resolve the actual global data address
+                     * and tile size from the CUtensorMap descriptor that was
+                     * cached at kernel launch time.  TMA uses a dedicated HW
+                     * engine — no warp coalescing, single trace entry. */
+                    memset(&tma_trace, 0, sizeof(tma_trace));
+                    tma_trace.m_opcode = cur_trace.m_opcode;
+                    tma_trace.m_is_fp = cur_trace.m_is_fp;
+                    tma_trace.m_is_load = true;
+                    tma_trace.m_cf_type = cur_trace.m_cf_type;
+                    tma_trace.m_num_read_regs = cur_trace.m_num_read_regs;
+                    tma_trace.m_num_dest_regs = cur_trace.m_num_dest_regs;
+                    memcpy(tma_trace.m_src, cur_trace.m_src, sizeof(tma_trace.m_src));
+                    memcpy(tma_trace.m_dst, cur_trace.m_dst, sizeof(tma_trace.m_dst));
+                    tma_trace.m_size = cur_trace.m_size;
+                    tma_trace.m_active_mask = cur_trace.m_active_mask;
+                    tma_trace.m_br_taken_mask = cur_trace.m_br_taken_mask;
+                    tma_trace.m_inst_addr = cur_trace.m_inst_addr;
+                    tma_trace.m_br_target_addr = cur_trace.m_br_target_addr;
+                    tma_trace.m_addr_space = m_addr_space;
+
+                    auto dit = tma_desc_by_launch.find(ma->grid_launch_id);
+                    if (dit != tma_desc_by_launch.end() && !dit->second.empty()) {
+                        uint64_t base_addr = dit->second[0].global_addr;
+                        tma_access_size = (int)dit->second[0].tile_bytes;
+                        /* Compute per-tile address using CTA index.
+                         * NVBit can't expose the TMA coordinate UREG, so we
+                         * use cta_id_x * tile_bytes as the byte offset.
+                         * This is correct for the common 1:1 CTA-to-tile
+                         * mapping pattern. */
+                        tma_trace.m_mem_addr = base_addr +
+                            (uint64_t)ma->cta_id_x * tma_access_size;
+                    } else {
+                        tma_trace.m_mem_addr = mem_addr;
+                        tma_access_size = (int)mem_access_size;
+                    }
+                    tma_trace.m_mem_access_size = tma_access_size;
+                    /* Also update cur_trace for debug text output (capped at 255) */
+                    cur_trace.m_mem_addr = tma_trace.m_mem_addr;
+                    cur_trace.m_mem_access_size = (tma_access_size <= 255) ? (uint8_t)tma_access_size : 255;
+                } else if (is_mem) {
                     compute_coalesced_sectors(ma->addrs, active_mask, sectors);
                     int num_sectors = (int)sectors.size();
 
@@ -835,10 +1092,13 @@ void* recv_thread_fun(void* args) {
                         children_trace.push_back(child_trace);
                     }
 
-                    /* Scale parent access size by total number of sectors */
+                    /* Scale parent access size by total number of sectors.
+                     * Cap at 255 to avoid uint8_t overflow (e.g. 8*32=256). */
                     if (num_sectors > 1) {
-                        cur_trace.m_mem_access_size *= num_sectors;
-                        mem_access_size *= num_sectors;
+                        uint32_t scaled = (uint32_t)cur_trace.m_mem_access_size * num_sectors;
+                        cur_trace.m_mem_access_size = (scaled <= 255) ? (uint8_t)scaled : 255;
+                        uint32_t scaled2 = (uint32_t)mem_access_size * num_sectors;
+                        mem_access_size = (scaled2 <= 255) ? (uint8_t)scaled2 : 255;
                     }
                 }
 
@@ -873,7 +1133,13 @@ void* recv_thread_fun(void* args) {
                     file << cur_trace.m_inst_addr << '\n';
                     file << cur_trace.m_br_target_addr << '\n';
                     file << cur_trace.m_mem_addr << '\n';
-                    file << (int)cur_trace.m_mem_access_size << '\n';
+                    /* Switch back to decimal for remaining fields */
+                    file << std::dec;
+                    /* For TMA, print the full (uncapped) access size */
+                    if (is_tma_load)
+                        file << tma_access_size << '\n';
+                    else
+                        file << (int)cur_trace.m_mem_access_size << '\n';
                     file << (int)cur_trace.m_num_barrier_threads << '\n';
                     file << MemorySpaceStr[cur_trace.m_addr_space] << '\n';
                     file << (int)cur_trace.m_cache_level << '\n';
@@ -901,6 +1167,8 @@ void* recv_thread_fun(void* args) {
                             file << children_trace[i].m_inst_addr << '\n';
                             file << children_trace[i].m_br_target_addr << '\n';
                             file << children_trace[i].m_mem_addr << '\n';
+                            /* Switch back to decimal for remaining fields */
+                            file << std::dec;
                             file << (int)children_trace[i].m_mem_access_size << '\n';
                             file << (int)children_trace[i].m_num_barrier_threads << '\n';
                             file << MemorySpaceStr[children_trace[i].m_addr_space] << '\n';
@@ -919,7 +1187,18 @@ void* recv_thread_fun(void* args) {
                     assert(0);
                 }
                 file_raw.write(reinterpret_cast<const char*>(&cur_trace), sizeof(cur_trace));
-                
+
+                /* Write TMA-extended trace to separate file (only when TMA_TRACE=1) */
+                if (is_tma_load && tma_trace_enabled) {
+                    snprintf(path_buf, sizeof(path_buf), "%sKernel%d/trace_tma_%lu.raw",
+                             trace_path.c_str(), kernel_id, (unsigned long)ma->warp_id);
+                    FileKey tma_key = {kernel_id + 100000, ma->warp_id}; /* distinct key */
+                    std::ofstream& tma_raw = raw_cache.get(tma_key, path_buf);
+                    if (tma_raw.is_open()) {
+                        tma_raw.write(reinterpret_cast<const char*>(&tma_trace), sizeof(tma_trace));
+                    }
+                }
+
                 if(is_mem) {
                     for (int i = 0; i < (int)children_trace.size(); i++){
                         file_raw.write(reinterpret_cast<const char*>(&children_trace[i]), sizeof(children_trace[i]));
