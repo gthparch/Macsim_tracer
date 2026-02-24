@@ -201,74 +201,15 @@ uint64_t grid_launch_id = 0;
 /* TMA descriptor cache: populated at kernel launch time by reading
  * CUtensorMap kernel arguments.  Key = grid_launch_id.
  * Value = vector of {globalAddress, tileBytes} for each TMA descriptor. */
-struct TmaDescInfo {
-    uint64_t global_addr;
-    uint32_t tile_bytes;
-    uint32_t element_size;  /* bytes per element (e.g. 4 for float32) */
-};
-
-/* Map CU_TENSOR_MAP_DATA_TYPE enum (from descriptor config word) to byte size */
-static uint32_t tma_dtype_to_bytes(uint32_t dtype_enum) {
-    switch (dtype_enum) {
-        case 0:  return 1;  /* UINT8 */
-        case 1:  return 2;  /* UINT16 */
-        case 2:  return 4;  /* UINT32 */
-        case 3:  return 4;  /* INT32 */
-        case 4:  return 8;  /* UINT64 */
-        case 5:  return 8;  /* INT64 */
-        case 6:  return 2;  /* FLOAT16 */
-        case 7:  return 4;  /* FLOAT32 */
-        case 8:  return 8;  /* FLOAT64 */
-        case 9:  return 2;  /* BFLOAT16 */
-        case 10: return 4;  /* FLOAT32_FTZ */
-        case 11: return 4;  /* TFLOAT32 */
-        case 12: return 4;  /* TFLOAT32_FTZ */
-        default: return 4;  /* assume 4 as fallback */
-    }
-}
 std::unordered_map<uint64_t, std::vector<TmaDescInfo>> tma_desc_by_launch;
 
-/* Per-launch kernel info: block dimensions needed for barrier thread count */
-struct KernelLaunchInfo {
-    uint32_t block_dim_x;
-    uint32_t block_dim_y;
-    uint32_t block_dim_z;
-    uint32_t total_threads_per_block() const {
-        return block_dim_x * block_dim_y * block_dim_z;
-    }
-};
 std::unordered_map<uint64_t, KernelLaunchInfo> launch_info_by_id;
-
-/* Count the number of commas in a function signature to estimate the number
- * of kernel parameters.  E.g. "kernel(float*, int, CUtensorMap)" → 3 params
- * (2 commas + 1).  Returns 0 if no parenthesis is found. */
-static int count_kernel_params(const std::string& func_name) {
-    size_t lp = func_name.find('(');
-    size_t rp = func_name.rfind(')');
-    if (lp == std::string::npos || rp == std::string::npos || rp <= lp + 1)
-        return 0;
-    std::string args = func_name.substr(lp + 1, rp - lp - 1);
-    if (args.empty() || args == "void") return 0;
-    int count = 1;
-    int depth = 0;
-    for (char c : args) {
-        if (c == '<' || c == '(') depth++;
-        else if (c == '>' || c == ')') depth--;
-        else if (c == ',' && depth == 0) count++;
-    }
-    return count;
-}
 
 /* Trace file path */
 std::string trace_path = "./default/";
 std::string sampled_kernel_path = "";
 std::string compress_path = "./compress";
 std::vector<int> sampled_kernel_ids;
-
-bool file_exists(const std::string& file_path) {
-    std::ifstream f(file_path);
-    return f.good();
-}
 
 /* To distinguish different Kernels */
 class UniqueKernelStore {
@@ -318,67 +259,6 @@ public:
     std::vector<std::unordered_map<uint64_t, uint64_t>> instr_counts;
     std::vector<std::string> kernels;
 };
-
-/* Opcode classification helpers — extract short opcode once */
-static std::string get_opcode_short(const std::string& opcode) {
-    std::size_t dot_pos = opcode.find('.');
-    return opcode.substr(0, dot_pos);
-}
-
-bool is_fp(const std::string& opcode_short) {
-    return FP_SET.count(opcode_short) > 0;
-}
-
-bool is_ld(const std::string& opcode_short) {
-    return LD_SET.count(opcode_short) > 0;
-}
-
-bool is_st(const std::string& opcode_short) {
-    return ST_SET.count(opcode_short) > 0;
-}
-
-// Check if the directory exists. If there isn't, make one. 
-bool create_a_directory(const std::string& dir_path, bool print) {
-    struct stat info;
-    if (stat(dir_path.c_str(), &info) != 0) {
-        if (mkdir(dir_path.c_str(), 0777) != 0) {
-            std::cerr << "Error: Failed to create directory: " << dir_path << std::endl;
-            return false;
-        }
-        if (print) std::cout << "Directory " << dir_path << " created." << std::endl;
-    } else if (!(info.st_mode & S_IFDIR)) {
-        std::cerr << "Error: Path is not a directory: " << dir_path << std::endl;
-        return false;
-    } else {
-        if (print) std::cout << "Directory " << dir_path << " already exists." << std::endl;
-    }
-    return true;
-}
-
-// Remove bracket in kernel name 
-std::string rm_bracket (std::string kernel_name){
-    kernel_name.erase(std::remove(kernel_name.begin(), kernel_name.end(), ' '), kernel_name.end());
-    size_t pos_bracket = kernel_name.find('(');
-    return kernel_name.substr(0, pos_bracket);
-}
-
-std::string cf_type(const std::string& opcode_short){ 
-    if (opcode_short == "JMP")
-        return "CF_BR";
-    else if (opcode_short == "BRA")
-        return "CF_CBR";
-    else if (opcode_short == "RET")
-        return "CF_RET";
-    else 
-        return "NOT_CF";
-}
-
-uint8_t num_dst_reg(const std::string& opcode_short) {
-    if (is_st(opcode_short) || NO_DST_SET.count(opcode_short))
-        return 0;
-    else
-        return 1;
-}
 
 void src_reg(mem_access_t* ma, uint8_t n_dst, uint16_t* src_reg_){
     for(int i=n_dst, j=0; i<ma->num_regs; i++, j++){
@@ -509,27 +389,6 @@ void nvbit_at_init() {
             assert(0);
         }
     }
-}
-
-/* Parse TMA load size from SASS opcode modifier string.
- * Looks for ".LxxxB" pattern (e.g. ".L128B" -> 128, ".L64B" -> 64).
- * If no size modifier is found (e.g. "UTMALDG.1D"), returns 128 — the
- * standard TMA tile transfer size.  The actual size is determined by the
- * CUtensorMap descriptor at runtime and cannot be read statically. */
-static uint32_t parse_tma_load_size(const std::string& opcode) {
-    size_t pos = opcode.find(".L");
-    while (pos != std::string::npos) {
-        size_t b_pos = opcode.find('B', pos + 2);
-        if (b_pos != std::string::npos) {
-            std::string num_str = opcode.substr(pos + 2, b_pos - pos - 2);
-            if (!num_str.empty() && std::all_of(num_str.begin(), num_str.end(), ::isdigit)) {
-                int size = std::stoi(num_str);
-                if (size > 0) return (uint32_t)size;
-            }
-        }
-        pos = opcode.find(".L", pos + 2);
-    }
-    return 128; // TMA tile default (actual size is in the tensor descriptor)
 }
 
 /* Set used to avoid re-instrumenting the same functions multiple times */
