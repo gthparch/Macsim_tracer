@@ -293,8 +293,6 @@ static const std::unordered_set<std::string> LD_SET = {
     "LD", "LDC", "LDG", "LDL", "LDS", "LDSM",
     /* Ampere */
     "LDGSTS",
-    /* Hopper TMA */
-    "UTMALDG",
 };
 
 static const std::unordered_set<std::string> ST_SET = {
@@ -355,36 +353,6 @@ static inline uint8_t num_dst_reg(const std::string& opcode_short) {
         return 1;
 }
 
-/* ------------------------------------------------------------------ */
-/*  TMA structs & helpers                                              */
-/* ------------------------------------------------------------------ */
-
-struct TmaDescInfo {
-    uint64_t global_addr;
-    uint32_t tile_bytes;
-    uint32_t element_size;  /* bytes per element (e.g. 4 for float32) */
-};
-
-/* Map CU_TENSOR_MAP_DATA_TYPE enum (from descriptor config word) to byte size */
-static inline uint32_t tma_dtype_to_bytes(uint32_t dtype_enum) {
-    switch (dtype_enum) {
-        case 0:  return 1;  /* UINT8 */
-        case 1:  return 2;  /* UINT16 */
-        case 2:  return 4;  /* UINT32 */
-        case 3:  return 4;  /* INT32 */
-        case 4:  return 8;  /* UINT64 */
-        case 5:  return 8;  /* INT64 */
-        case 6:  return 2;  /* FLOAT16 */
-        case 7:  return 4;  /* FLOAT32 */
-        case 8:  return 8;  /* FLOAT64 */
-        case 9:  return 2;  /* BFLOAT16 */
-        case 10: return 4;  /* FLOAT32_FTZ */
-        case 11: return 4;  /* TFLOAT32 */
-        case 12: return 4;  /* TFLOAT32_FTZ */
-        default: return 4;  /* assume 4 as fallback */
-    }
-}
-
 /* Per-launch kernel info: block dimensions needed for barrier thread count */
 struct KernelLaunchInfo {
     uint32_t block_dim_x;
@@ -394,47 +362,6 @@ struct KernelLaunchInfo {
         return block_dim_x * block_dim_y * block_dim_z;
     }
 };
-
-/* Count the number of commas in a function signature to estimate the number
- * of kernel parameters.  E.g. "kernel(float*, int, CUtensorMap)" -> 3 params
- * (2 commas + 1).  Returns 0 if no parenthesis is found. */
-static inline int count_kernel_params(const std::string& func_name) {
-    size_t lp = func_name.find('(');
-    size_t rp = func_name.rfind(')');
-    if (lp == std::string::npos || rp == std::string::npos || rp <= lp + 1)
-        return 0;
-    std::string args = func_name.substr(lp + 1, rp - lp - 1);
-    if (args.empty() || args == "void") return 0;
-    int count = 1;
-    int depth = 0;
-    for (char c : args) {
-        if (c == '<' || c == '(') depth++;
-        else if (c == '>' || c == ')') depth--;
-        else if (c == ',' && depth == 0) count++;
-    }
-    return count;
-}
-
-/* Parse TMA load size from SASS opcode modifier string.
- * Looks for ".LxxxB" pattern (e.g. ".L128B" -> 128, ".L64B" -> 64).
- * If no size modifier is found (e.g. "UTMALDG.1D"), returns 128 -- the
- * standard TMA tile transfer size.  The actual size is determined by the
- * CUtensorMap descriptor at runtime and cannot be read statically. */
-static inline uint32_t parse_tma_load_size(const std::string& opcode) {
-    size_t pos = opcode.find(".L");
-    while (pos != std::string::npos) {
-        size_t b_pos = opcode.find('B', pos + 2);
-        if (b_pos != std::string::npos) {
-            std::string num_str = opcode.substr(pos + 2, b_pos - pos - 2);
-            if (!num_str.empty() && std::all_of(num_str.begin(), num_str.end(), ::isdigit)) {
-                int size = std::stoi(num_str);
-                if (size > 0) return (uint32_t)size;
-            }
-        }
-        pos = opcode.find(".L", pos + 2);
-    }
-    return 128; // TMA tile default (actual size is in the tensor descriptor)
-}
 
 /* ------------------------------------------------------------------ */
 /*  General utilities                                                  */

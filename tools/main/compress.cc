@@ -46,17 +46,23 @@ void compress_worker(std::vector<CompressTask>& tasks,
         }
 
         int bytes_read;
+        bool write_error = false;
         while ((bytes_read = input_file.read(
                     reinterpret_cast<char*>(buffer), CHUNK_SIZE).gcount()) > 0) {
             int bytes_written = gzwrite(output_file, buffer, bytes_read);
             if (bytes_written == 0) {
                 std::cerr << "Error writing: " << t.output_path << "\n";
+                write_error = true;
                 break;
             }
         }
 
         gzclose(output_file);
         input_file.close();
+        if (write_error) {
+            std::remove(t.output_path.c_str());
+            continue;
+        }
         std::remove(t.input_path.c_str());
 
         int done = files_done.fetch_add(1) + 1;

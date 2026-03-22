@@ -92,30 +92,3 @@ typedef struct trace_info_nvbit_small_s {
 
 } trace_info_nvbit_small_s;
 
-/* Extended trace for TMA (Tensor Memory Access) instructions.
- * Identical layout to trace_info_nvbit_small_s for all common fields,
- * but uses int for m_mem_access_size to support multi-KB tile transfers.
- * Written to a separate raw file (trace_tma_*.raw) so that existing
- * trace readers remain unaffected. */
-typedef struct trace_info_tma_s {
-  uint8_t m_opcode;
-  bool m_is_fp;
-  bool m_is_load;
-  uint8_t m_cf_type;
-  uint8_t m_num_read_regs;
-  uint8_t m_num_dest_regs;
-  uint16_t m_src[MAX_GPU_SRC_NUM];
-  uint16_t m_dst[MAX_GPU_DST_NUM];
-  uint8_t m_size;
-
-  uint32_t m_active_mask;
-  uint32_t m_br_taken_mask;
-  uint64_t m_inst_addr;
-  uint64_t m_br_target_addr;
-  uint64_t m_mem_addr;
-  int m_mem_access_size;  /* int: supports multi-KB TMA tiles */
-  uint16_t m_num_barrier_threads;
-  uint8_t m_addr_space;
-  uint8_t m_cache_level;
-  uint8_t m_cache_operator;
-} trace_info_tma_s;
